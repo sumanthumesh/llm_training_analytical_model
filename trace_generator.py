@@ -90,6 +90,7 @@ sharding_formulas = {
     "fwd_cp_all_gather_v" : M*S/cp*H_k/tp*D_h,
     "fwd_tp_all_reduce_attn" : M*S/cp*D,
     "fwd_tp_all_reduce_ffn" : M*S/cp*D,
+    "fwd_fsdp_all_gather" : M*S/cp*D,
 }
 
 def pipeline_stage_from_layer_id(layer_id:int,num_layers:int) -> int:
@@ -202,6 +203,30 @@ def single_layer_forward_pass(layer_id,microbatch_id):
         []
     )
 
+    #If this is the first microbatch, then we need to fetch weights across fsdp
+    if microbatch_id == 0:
+        fsdp_all_gather_comm_groups = permute_axes(-2,-1,pipeline_stage_id,-1)
+        fsdp_all_gather_nodes = []
+        for comm_group in fsdp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(fsdp_all_gather_comm_groups))]:
+            all_gather = Node(
+                "COMM",
+                "ALL_GATHER",
+                f"mb{microbatch_id}.layer{layer_id}.fwd.fsdp_all_gather",
+                comm_group,
+                sharding_formulas["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES),
+                [pre_layer_sync_node.id]
+            )
+            fsdp_all_gather_nodes.append(all_gather)
+
+    post_fsdp_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.fwd.post_fsdp_all_gather",
+        [],
+        0,
+        [node.id for node in fsdp_all_gather_nodes] if microbatch_id == 0 else [pre_layer_sync_node.id]
+    )
+
     #If we are doing all gather across CP and for a fixed PP, then there will be an equivalent all gather across each TP and DP.
     #So there are a total of DP*TP all gather operations across CP for each layer and microbatch. 
     #We can get the comm groups for each of these all gather operations by permuting the axes
@@ -215,7 +240,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.k",
             comm_group,
             sharding_formulas["fwd_cp_all_gather_k"].subs(SUBSTITUTE_VALUES),
-            [pre_layer_sync_node.id]
+            [post_fsdp_sync_node.id]
         )
         all_gather_v = Node(
             "COMM",
@@ -223,7 +248,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.v",
             comm_group,
             sharding_formulas["fwd_cp_all_gather_v"].subs(SUBSTITUTE_VALUES),
-            [pre_layer_sync_node.id]
+            [post_fsdp_sync_node.id]
         )
         cp_all_gather_nodes.append(all_gather_k)
         cp_all_gather_nodes.append(all_gather_v)
