@@ -4,7 +4,7 @@ import sys
 import json
 import sympy
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, ClassVar, Set
+from typing import List, Dict, Any, ClassVar, Set, Tuple
 from itertools import product
 import numpy as np
 
@@ -528,26 +528,27 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
     num_pipeline_stages = pp.subs(SUBSTITUTE_VALUES)
     layers_per_stage = num_layers // num_pipeline_stages
 
-    fwd_stages = []
+    fwd_stages:Dict[int,Tuple[Node, Node]] = dict()
     for i in range(num_pipeline_stages):
         layer_ids = list(range(i*layers_per_stage, (i+1)*layers_per_stage))
-        fwd_stages.append(forward_pipeline_stage(layer_ids,i,microbatch_id))
+        fwd_stages[i] = forward_pipeline_stage(layer_ids,i,microbatch_id)
 
     #Wire them up
     for i in range(1,num_pipeline_stages):
         fwd_stages[i][0].deps.append(fwd_stages[i-1][1].id)
 
-    bwd_stages = []
+    bwd_stages:Dict[int,Tuple[Node, Node]] = dict()
     for i in range(num_pipeline_stages):
         layer_ids = list(reversed(range((num_pipeline_stages-i-1)*layers_per_stage, (num_pipeline_stages-i)*layers_per_stage)))
-        bwd_stages.append(backward_pipeline_stage(layer_ids,num_pipeline_stages-i-1,microbatch_id))
+        print(f"Layer_ids:{layer_ids}")
+        bwd_stages[num_pipeline_stages-i-1] = backward_pipeline_stage(layer_ids,num_pipeline_stages-i-1,microbatch_id)
 
     #Wire them up
     for i in range(1,num_pipeline_stages):
-        bwd_stages[i][0].deps.append(bwd_stages[i-1][1].id)
+        bwd_stages[i-1][0].deps.append(bwd_stages[i][1].id)
 
     # Connect forward and backward passes
-    bwd_stages[0][0].deps.append(fwd_stages[-1][1].id)
+    bwd_stages[num_pipeline_stages-1][0].deps.append(fwd_stages[num_pipeline_stages-1][1].id)
 
     return fwd_stages, bwd_stages
 
