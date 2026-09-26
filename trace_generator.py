@@ -386,13 +386,63 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         )
         tp_all_reduce_attn_nodes.append(all_reduce_attn)
 
+    tp_all_reduce_attn_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.post_tp_all_reduce.attn",
+        [],
+        0,
+        [node.id for node in tp_all_reduce_attn_nodes]
+    )
+
+    #If this is the last microbatch, then current gradients are dp,cp sharded
+    #I'm assuming FSDP is only across DP. So we will need to do reduce_scatter across DP followed by all_reduce across CP
+
+    num_microbatches = B.subs(SUBSTITUTE_VALUES) // M.subs(SUBSTITUTE_VALUES)
+    if microbatch_id == num_microbatches - 1:
+
+        grad_dp_reduce_scatter_comm_groups = permute_axes(-2,-1,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
+        grad_dp_reduce_scatter_nodes = []
+        for comm_group in grad_dp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_dp_reduce_scatter_comm_groups))]:
+            grad_reduce_scatter = Node(
+                "COMM",
+                "REDUCE_SCATTER",
+                f"mb{microbatch_id}.layer{layer_id}.bwd.grad_dp_reduce_scatter",
+                comm_group,
+                sharding_formulas["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES),
+                [tp_all_reduce_attn_sync_node.id]
+            )
+            grad_dp_reduce_scatter_nodes.append(grad_reduce_scatter)
+
+        grad_dp_reduce_scatter_sync_node = Node(
+            "SYNC",
+            "BARRIER",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.post_grad_dp_reduce_scatter",
+            [],
+            0,
+            [node.id for node in grad_dp_reduce_scatter_nodes]
+        )
+
+        grad_cp_all_reduce_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
+        grad_cp_all_reduce_nodes = []
+        for comm_group in grad_cp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_cp_all_reduce_comm_groups))]:
+            grad_all_reduce = Node(
+                "COMM",
+                "ALL_REDUCE",
+                f"mb{microbatch_id}.layer{layer_id}.bwd.grad_cp_all_reduce",
+                comm_group,
+                sharding_formulas["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES),
+                [grad_dp_reduce_scatter_sync_node.id]
+            )
+            grad_cp_all_reduce_nodes.append(grad_all_reduce)    
+
     post_layer_sync_node = Node(
         "SYNC",
         "POST_LAYER",
         f"mb{microbatch_id}.layer{layer_id}.bwd.post_layer_sync",
         [],
         0,
-        [node.id for node in tp_all_reduce_attn_nodes]
+        [node.id for node in grad_cp_all_reduce_nodes] if microbatch_id == num_microbatches - 1 else [tp_all_reduce_attn_sync_node.id]
     )
 
     return [pre_layer_sync_node,post_layer_sync_node]
@@ -540,7 +590,7 @@ if __name__ == '__main__':
     # # print(fwd_layers[1][1].name)
     # bwd_layers[0][0].deps.append(fwd_layers[-1][1].id)
 
-    pipeline_pass_for_single_microbatch(0,8)
+    pipeline_pass_for_single_microbatch(0,6)
 
     all_nodes_single_layer_single_microbatch = Node._all_nodes
 
