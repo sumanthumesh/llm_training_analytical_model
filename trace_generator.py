@@ -127,6 +127,22 @@ def axes_from_node_id(node_id:int):
 
     return d,p,c,t
 
+def get_pp_transfer_comm_groups(from_stage:int,to_stage:int):
+    TP=tp.subs(SUBSTITUTE_VALUES)
+    DP=dp.subs(SUBSTITUTE_VALUES)
+    CP=cp.subs(SUBSTITUTE_VALUES)
+
+    comm_group_coords = []
+
+    for d in range(DP):
+        for c in range(CP):
+            for t in range(TP):
+                comm_group_coords.append([(d,c,from_stage,t),(d,c,to_stage,t)])
+    
+    comm_group_node_ids = [[node_id_from_axes(*coord) for coord in group] for group in comm_group_coords]
+    return comm_group_node_ids
+
+
 def permute_axes(d:int,c:int,p:int,t:int)->List[List[int]]:
     DP=dp.subs(SUBSTITUTE_VALUES)
     CP=cp.subs(SUBSTITUTE_VALUES)
@@ -398,7 +414,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     #If this is the last microbatch, then current gradients are dp,cp sharded
     #I'm assuming FSDP is only across DP. So we will need to do reduce_scatter across DP followed by all_reduce across CP
 
-    num_microbatches = B.subs(SUBSTITUTE_VALUES) // M.subs(SUBSTITUTE_VALUES)
+    num_microbatches = B.subs(SUBSTITUTE_VALUES) // (M.subs(SUBSTITUTE_VALUES)*dp.subs(SUBSTITUTE_VALUES))
     if microbatch_id == num_microbatches - 1:
 
         grad_dp_reduce_scatter_comm_groups = permute_axes(-2,-1,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
@@ -533,9 +549,22 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
         layer_ids = list(range(i*layers_per_stage, (i+1)*layers_per_stage))
         fwd_stages[i] = forward_pipeline_stage(layer_ids,i,microbatch_id)
 
-    #Wire them up
+    #Wire them up with SEND/RECV nodes
     for i in range(1,num_pipeline_stages):
-        fwd_stages[i][0].deps.append(fwd_stages[i-1][1].id)
+        # Create SEND/RECV nodes. They will sit between the post_pipeline_sync of the previous stage and the pre_pipeline_sync of the current stage.
+        pipeline_transfer_comm_groups = get_pp_transfer_comm_groups(i-1,i)
+        fwd_send_recv_nodes = []
+        for comm_group in pipeline_transfer_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(pipeline_transfer_comm_groups))]:
+            send_recv_node = Node(
+                "COMM",
+                "SEND_RECV",
+                f"mb{microbatch_id}.pipeline_stage{i-1}_to_{i}.fwd.send_recv",
+                comm_group,
+                0,  # Assuming size is 0 for SEND/RECV nodes; adjust if needed
+                [fwd_stages[i-1][1].id]  # Depends on the post_pipeline_sync of the previous stage
+            )
+            fwd_send_recv_nodes.append(send_recv_node)
+        fwd_stages[i][0].deps.extend([node.id for node in fwd_send_recv_nodes])  # The pre_pipeline_sync of the current stage depends on the SEND/RECV nodes
 
     bwd_stages:Dict[int,Tuple[Node, Node]] = dict()
     for i in range(num_pipeline_stages):
@@ -545,9 +574,23 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
 
     #Wire them up
     for i in range(1,num_pipeline_stages):
-        bwd_stages[i-1][0].deps.append(bwd_stages[i][1].id)
+        # Create SEND/RECV nodes. They will sit between the post_pipeline_sync of the previous stage and the pre_pipeline_sync of the current stage.
+        pipeline_transfer_comm_groups = get_pp_transfer_comm_groups(i,i-1)
+        bwd_send_recv_nodes = []
+        for comm_group in pipeline_transfer_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(pipeline_transfer_comm_groups))]:
+            send_recv_node = Node(
+                "COMM",
+                "SEND_RECV",
+                f"mb{microbatch_id}.pipeline_stage{i}_to_{i-1}.bwd.send_recv",
+                comm_group,
+                0,  # Assuming size is 0 for SEND/RECV nodes; adjust if needed
+                [bwd_stages[i][1].id]  # Depends on the post_pipeline_sync of the current stage
+            )
+            bwd_send_recv_nodes.append(send_recv_node)
+        bwd_stages[i-1][0].deps.extend([node.id for node in bwd_send_recv_nodes])
 
     # Connect forward and backward passes
+    # This doesn't require a SEND_RECV because its the same ranks
     bwd_stages[num_pipeline_stages-1][0].deps.append(fwd_stages[num_pipeline_stages-1][1].id)
 
     return fwd_stages, bwd_stages
@@ -575,12 +618,19 @@ def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate a analytical model compatible DAG from model and training config")
+    parser.add_argument("--single-comm", "-s", action="store_true", help="Generate a single comm group for all communication operations")
 
     #I'm fixing the ordering for sharding axes based on how deep inside the model they are located
     #dp replicates entire model
     #cp is at sequence level
     #pp happens at multi layer level
     #tp and ep happen at sublayer level
+    args = parser.parse_args()
+    if args.single_comm:
+        MAX_COMM_GROUPS_PER_COMM = 1
+    else:
+        MAX_COMM_GROUPS_PER_COMM = 1000000
+
     sharding_axes_symbols = [dp,cp,pp,tp]
     sharding_axes = [s.subs(SUBSTITUTE_VALUES) for s in sharding_axes_symbols]
 
