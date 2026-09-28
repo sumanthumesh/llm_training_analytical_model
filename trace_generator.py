@@ -7,14 +7,16 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, ClassVar, Set, Tuple
 from itertools import product
 import numpy as np
+import enum
 
 L = sympy.symbols("L")
 H_k = sympy.symbols("H_k")
 H_q = sympy.symbols("H_q")
-H_g = sympy.symbols("H_g")
-D = sympy.symbols("D")
+H_g = H_q/H_k
 D_h = sympy.symbols("D_h")
+D = D_h*H_q
 D_ff = sympy.symbols("D_ff")
+V = sympy.symbols("V")
 dp = sympy.symbols("dp")
 pp = sympy.symbols("pp")
 cp = sympy.symbols("cp")
@@ -24,20 +26,19 @@ S = sympy.symbols("S")
 M = sympy.symbols("M")
 
 SUBSTITUTE_VALUES = {
-    L: 24,
-    H_k: 12,
-    H_q: 12,
-    H_g: 12,
+    L: 128,
+    H_k: 8,
+    H_q: 128,
     D_h: 128,
-    D: 512,
-    D_ff: 512,
-    dp: 2,
-    pp: 2,
-    cp: 2,
-    tp: 4,
-    B: 4,
-    S: 4,
-    M: 4
+    D_ff: 53248,
+    V: 128000,
+    dp: 4,
+    pp: 16,
+    cp: 1,
+    tp: 8,
+    B: 32*4,
+    S: 8192,
+    M: 16
 }
 
 MAX_COMM_GROUPS_PER_COMM = 1
@@ -85,13 +86,40 @@ class CommGroupTracker:
             self.comm_groups[nodes] = new_id
             return True
 
+sharded_weight_sizes = {
+    "W_k": D*H_k/tp*D_h,
+    "W_v": D*H_k/tp*D_h,
+    "W_q": D*H_q/tp*D_h,
+    "W_oA": H_q/tp*D_h*D,
+    "W_1": D*D_ff/tp,
+    "W_2": D*D_ff/tp,
+    "W_oF": D_ff/tp*D
+}
+
+def per_layer_weight_sizes():
+    #Note these are already sharded across tp
+    total = sum(sharded_weight_sizes.values())
+    return total
+
+def per_layer_gradient_sizes():
+    #Assuming grdient size is same as weight size
+    return per_layer_weight_sizes()
+
 sharding_formulas = {
     "fwd_cp_all_gather_k" : M*S/cp*H_k/tp*D_h,
     "fwd_cp_all_gather_v" : M*S/cp*H_k/tp*D_h,
     "fwd_tp_all_reduce_attn" : M*S/cp*D,
     "fwd_tp_all_reduce_ffn" : M*S/cp*D,
-    "fwd_fsdp_all_gather" : M*S/cp*D,
+    "fwd_fsdp_all_gather" : per_layer_weight_sizes(),
+    "bwd_tp_all_reduce_ffn" : M*S/cp*D,
+    "bwd_cp_reduce_scatter_k" : M*S/cp*H_k/tp*D_h,
+    "bwd_cp_reduce_scatter_v" : M*S/cp*H_k/tp*D_h,
+    "bwd_tp_all_reduce_attn" : M*S/cp*D,
+    "bwd_fsdp_reduce_scatter" : per_layer_gradient_sizes(),
+    "bwd_cp_all_reduce" : per_layer_gradient_sizes(),
 }
+
+
 
 def pipeline_stage_from_layer_id(layer_id:int,num_layers:int) -> int:
     num_pipeline_stages = pp.subs(SUBSTITUTE_VALUES)
@@ -203,7 +231,6 @@ def permute_axes(d:int,c:int,p:int,t:int)->List[List[int]]:
     # print(npu_id_matrix.tolist())
 
     return npu_id_matrix.tolist()
-    
 
 def single_layer_forward_pass(layer_id,microbatch_id):
     #FSDP fetch is outside the scope of this function
@@ -220,9 +247,9 @@ def single_layer_forward_pass(layer_id,microbatch_id):
     )
 
     #If this is the first microbatch, then we need to fetch weights across fsdp
+    fsdp_all_gather_nodes = []
     if microbatch_id == 0:
         fsdp_all_gather_comm_groups = permute_axes(-2,-1,pipeline_stage_id,-1)
-        fsdp_all_gather_nodes = []
         for comm_group in fsdp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(fsdp_all_gather_comm_groups))]:
             all_gather = Node(
                 "COMM",
@@ -343,7 +370,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.ffn",
             comm_group,
-            sharding_formulas["fwd_tp_all_reduce_ffn"].subs(SUBSTITUTE_VALUES),
+            sharding_formulas["bwd_tp_all_reduce_ffn"].subs(SUBSTITUTE_VALUES),
             [pre_layer_sync_node.id]
         )
         tp_all_reduce_ffn_nodes.append(all_reduce_ffn)
@@ -365,7 +392,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.k",
             comm_group,
-            sharding_formulas["fwd_cp_all_gather_k"].subs(SUBSTITUTE_VALUES),
+            sharding_formulas["bwd_cp_reduce_scatter_k"].subs(SUBSTITUTE_VALUES),
             [tp_all_reduce_ffn_sync_node.id]
         )
         reduce_scatter_v = Node(
@@ -373,7 +400,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.v",
             comm_group,
-            sharding_formulas["fwd_cp_all_gather_k"].subs(SUBSTITUTE_VALUES),
+            sharding_formulas["bwd_cp_reduce_scatter_v"].subs(SUBSTITUTE_VALUES),
             [tp_all_reduce_ffn_sync_node.id]
         )
         cp_reduce_scatter_nodes.append(reduce_scatter_k)
@@ -397,7 +424,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.attn",
             comm_group,
-            sharding_formulas["fwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES),
+            sharding_formulas["bwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES),
             [cp_reduce_scatter_sync_node.id]
         )
         tp_all_reduce_attn_nodes.append(all_reduce_attn)
@@ -415,17 +442,18 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     #I'm assuming FSDP is only across DP. So we will need to do reduce_scatter across DP followed by all_reduce across CP
 
     num_microbatches = B.subs(SUBSTITUTE_VALUES) // (M.subs(SUBSTITUTE_VALUES)*dp.subs(SUBSTITUTE_VALUES))
+    grad_dp_reduce_scatter_nodes = []
+    grad_cp_all_reduce_nodes = []
     if microbatch_id == num_microbatches - 1:
 
         grad_dp_reduce_scatter_comm_groups = permute_axes(-2,-1,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
-        grad_dp_reduce_scatter_nodes = []
         for comm_group in grad_dp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_dp_reduce_scatter_comm_groups))]:
             grad_reduce_scatter = Node(
                 "COMM",
                 "REDUCE_SCATTER",
                 f"mb{microbatch_id}.layer{layer_id}.bwd.grad_dp_reduce_scatter",
                 comm_group,
-                sharding_formulas["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES),
+                sharding_formulas["bwd_fsdp_reduce_scatter"].subs(SUBSTITUTE_VALUES),
                 [tp_all_reduce_attn_sync_node.id]
             )
             grad_dp_reduce_scatter_nodes.append(grad_reduce_scatter)
@@ -440,14 +468,13 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         )
 
         grad_cp_all_reduce_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
-        grad_cp_all_reduce_nodes = []
         for comm_group in grad_cp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_cp_all_reduce_comm_groups))]:
             grad_all_reduce = Node(
                 "COMM",
                 "ALL_REDUCE",
                 f"mb{microbatch_id}.layer{layer_id}.bwd.grad_cp_all_reduce",
                 comm_group,
-                sharding_formulas["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES),
+                sharding_formulas["bwd_cp_all_reduce"].subs(SUBSTITUTE_VALUES),
                 [grad_dp_reduce_scatter_sync_node.id]
             )
             grad_cp_all_reduce_nodes.append(grad_all_reduce)    
@@ -595,6 +622,185 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
 
     return fwd_stages, bwd_stages
 
+def get_pp_1f1b_schedule(num_pipeline_stages:int, num_microbatches:int):
+
+    class Dir(enum.Enum):
+        F = 1
+        B = 2
+
+    @dataclass
+    class PPNode:
+        dir:Dir
+        microbatch:int
+
+        def __str__(self):
+            return f"{self.dir.name}{self.microbatch}"
+
+    @dataclass
+    class MBStatus:
+        pp:int
+        dir:Dir
+
+        def __str__(self):
+            return f"{self.pp},{self.dir.name}"
+
+    @dataclass
+    class PPRank:
+        rank:int
+        occupied:bool
+        node:PPNode
+
+        def __str__(self):
+            if self.occupied:
+                return str(self.node)
+            else:
+                return ""
+
+    #Create hardware nodes for each PP rank
+    ranks:Dict[int,PPRank] = {i:PPRank(rank=i, occupied=False, node=PPNode(dir=Dir.F, microbatch=-1)) for i in range(num_pipeline_stages)}
+
+    # for i in range(num_pipeline_stages):
+    #     print(f"Rank {i}: {ranks[i]}")
+
+    #Maintain one list of to complete operation for each microbatch
+    microbatch_ops:Dict[int,MBStatus] = {i:MBStatus(pp=0, dir=Dir.F) for i in range(num_microbatches)}
+
+    # for i in range(num_microbatches):
+    #     print(f"Microbatch {i}: {microbatch_ops[i]}")
+
+    tick = 0
+
+    steps:List[Dict[int,str]] = []
+
+    #Number of forwards issued at stage i that haven't yet had their backward issued at
+    #stage i. 1F1B's defining property is capping this at (num_pipeline_stages - i), so
+    #a stage is only allowed to race ahead on new forwards up to that bound instead of
+    #greedily issuing every forward that happens to be ready.
+    in_flight:Dict[int,int] = {i:0 for i in range(num_pipeline_stages)}
+
+    while True:
+
+        if len(microbatch_ops) == 0:
+            break
+
+        #Reset ranks
+        for i in range(num_pipeline_stages):
+            ranks[i].occupied = False
+
+        #Current step
+        curr_step:Dict[int,str] = {pp_stage_id:"" for pp_stage_id,pp_stage in ranks.items()}
+
+        def issue(mb_id:int, mb:MBStatus):
+            ranks[mb.pp].occupied = True
+            ranks[mb.pp].node = PPNode(dir=mb.dir, microbatch=mb_id)
+            curr_step[mb.pp] = str(ranks[mb.pp].node)
+            #Update the microbatch status to the next operation
+            if mb.dir == Dir.F:
+                if mb.pp == num_pipeline_stages - 1:
+                    #Last stage, next op is backward
+                    microbatch_ops[mb_id] = MBStatus(pp=mb.pp, dir=Dir.B)
+                else:
+                    #Next op is forward on next stage
+                    microbatch_ops[mb_id] = MBStatus(pp=mb.pp + 1, dir=Dir.F)
+            else:
+                #Retiring this backward frees up this stage's in-flight slot.
+                in_flight[mb.pp] -= 1
+                if mb.pp == 0:
+                    #Last stage, next op is done
+                    del microbatch_ops[mb_id]
+                else:
+                    #Next op is backward on previous stage
+                    microbatch_ops[mb_id] = MBStatus(pp=mb.pp - 1, dir=Dir.B)
+
+        #Backward ops are issued first: they're never capped, and draining them before
+        #considering any forward is what lets a capped-out stage make progress again in
+        #the same tick a backward arrives, instead of losing a tick to ordering.
+        for mb_id,mb in sorted(microbatch_ops.items()):
+            if mb.dir != Dir.B or ranks[mb.pp].occupied:
+                continue
+            issue(mb_id, mb)
+
+        #Forward ops only get issued up to the per-stage in-flight cap; beyond that the
+        #rank is deliberately left idle (a bubble) even though the microbatch is ready,
+        #which is exactly what bounds 1F1B's memory usage relative to GPipe.
+        for mb_id,mb in sorted(microbatch_ops.items()):
+            if mb.dir != Dir.F or ranks[mb.pp].occupied:
+                continue
+            if in_flight[mb.pp] >= num_pipeline_stages - mb.pp:
+                continue
+            in_flight[mb.pp] += 1
+            issue(mb_id, mb)
+
+        tick += 1
+
+        # print(f"Tick {tick}")
+        # for i in range(num_pipeline_stages):
+        #         print(f"Rank {i}: {ranks[i]}")
+        steps.append(curr_step)
+
+    # print("Steps:")
+    # for i, step in enumerate(steps):
+    #     print(f"Tick {i}: {step}")
+
+    display_steps:Dict[int,List[str]] = {}
+    for step in steps:
+        for pp_stage_id,op in step.items():
+            if pp_stage_id not in display_steps:
+                display_steps[pp_stage_id] = []
+            display_steps[pp_stage_id].append(op)
+
+    # for display_pp_stage_id,display_ops in display_steps.items():
+    #     print(f"PP Stage {display_pp_stage_id}:",end='')
+    #     op_list = [f"{op:^4}" for op in display_ops]
+    #     print(" | ".join(op_list))
+
+    dependency_chains:Dict[int,List[str]] = dict()
+    for display_pp_stage_id,display_ops in display_steps.items():
+        dependency_chains[display_pp_stage_id] = []
+        for op in display_ops:
+            if op != "":
+                dependency_chains[display_pp_stage_id].append(op)
+
+    return dependency_chains
+
+def construct_1f1b_schedule(num_microbatches:int):
+    #Get the dependency chains for each PP stage
+    dependency_chains = get_pp_1f1b_schedule(pp.subs(SUBSTITUTE_VALUES), num_microbatches)
+
+    #Generate the pipeline pass for each microbatch
+    microbatch_passes:Dict[int,Tuple[Dict[int,Tuple[Node, Node]], Dict[int,Tuple[Node, Node]]]] = {}
+    for microbatch_id in range(num_microbatches):
+        microbatch_passes[microbatch_id] = pipeline_pass_for_single_microbatch(microbatch_id, L.subs(SUBSTITUTE_VALUES))
+
+    #Wire up according to microbatch dependency chains
+    for pp_stage_id,chain in dependency_chains.items():
+        for i in range(1, len(chain)):
+            prev_op = chain[i-1]
+            curr_op = chain[i]
+            prev_microbatch_id = int(prev_op[1:])
+            curr_microbatch_id = int(curr_op[1:])
+            prev_dir = prev_op[0]
+            curr_dir = curr_op[0]
+
+            if prev_microbatch_id == curr_microbatch_id:
+                #This is a dependency within the same microbatch, which is already wired up in pipeline_pass_for_single_microbatch
+                continue
+
+            if prev_dir == "F" and curr_dir == "F":
+                #Connect the post_pipeline_sync of the previous microbatch to the pre_pipeline_sync of the current microbatch
+                microbatch_passes[curr_microbatch_id][0][pp_stage_id][0].deps.append(microbatch_passes[prev_microbatch_id][0][pp_stage_id][1].id)
+            elif prev_dir == "B" and curr_dir == "B":
+                #Connect the post_pipeline_sync of the previous microbatch to the pre_pipeline_sync of the current microbatch
+                microbatch_passes[curr_microbatch_id][1][pp_stage_id][0].deps.append(microbatch_passes[prev_microbatch_id][1][pp_stage_id][1].id)
+            elif prev_dir == "F" and curr_dir == "B":
+                #Connect the post_pipeline_sync of the previous microbatch to the pre_pipeline_sync of the current microbatch
+                microbatch_passes[curr_microbatch_id][1][pp_stage_id][0].deps.append(microbatch_passes[prev_microbatch_id][0][pp_stage_id][1].id)
+            elif prev_dir == "B" and curr_dir == "F":
+                #Connect the post_pipeline_sync of the previous microbatch to the pre_pipeline_sync of the current microbatch
+                microbatch_passes[curr_microbatch_id][0][pp_stage_id][0].deps.append(microbatch_passes[prev_microbatch_id][1][pp_stage_id][1].id)
+            else:
+                raise ValueError(f"Invalid dependency chain: {prev_op} -> {curr_op}")
+
 def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
     #Ignoring comm group deduplication (CommGroupTracker) for now — comm_group is written
     #as the literal list of involved NPU ids per node, for visual inspection.
@@ -616,6 +822,24 @@ def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
     with open(filepath, "w") as f:
         json.dump(json_obj, f, indent=2)
 
+#Divisibility checks for model and training config
+def check_divisibility():
+    DP=dp.subs(SUBSTITUTE_VALUES)
+    CP=cp.subs(SUBSTITUTE_VALUES)
+    PP=pp.subs(SUBSTITUTE_VALUES)
+    TP=tp.subs(SUBSTITUTE_VALUES)
+    microbatch_size=M.subs(SUBSTITUTE_VALUES)
+    global_batch_size=B.subs(SUBSTITUTE_VALUES)
+    num_layers=L.subs(SUBSTITUTE_VALUES)
+
+    #Batch size should be divisible by DP
+    assert global_batch_size % DP == 0, f"Batch size {global_batch_size} is not divisible by data parallelism {DP}"
+    #Batch size // DP should be divisible by microbatches
+    assert (global_batch_size // DP) % microbatch_size == 0, f"Batch size {global_batch_size} // data parallelism {DP} = {global_batch_size//DP} is not divisible by microbatches {microbatch_size}"
+    #Number of layers should be divisible by PP
+    assert num_layers % PP == 0, f"Number of layers {num_layers} is not divisible by pipeline parallelism {PP}"
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate a analytical model compatible DAG from model and training config")
     parser.add_argument("--single-comm", "-s", action="store_true", help="Generate a single comm group for all communication operations")
@@ -634,6 +858,8 @@ if __name__ == '__main__':
     sharding_axes_symbols = [dp,cp,pp,tp]
     sharding_axes = [s.subs(SUBSTITUTE_VALUES) for s in sharding_axes_symbols]
 
+    check_divisibility()
+
     # fwd_layers = forward_pipeline_stage([0,1,2,3],0,0)
     # bwd_layers = backward_pipeline_stage([3,2,1,0],0,0)
 
@@ -641,8 +867,18 @@ if __name__ == '__main__':
     # # print(fwd_layers[1][1].name)
     # bwd_layers[0][0].deps.append(fwd_layers[-1][1].id)
 
-    pipeline_pass_for_single_microbatch(0,6)
+    # pipeline_pass_for_single_microbatch(0,6)
 
-    all_nodes_single_layer_single_microbatch = Node._all_nodes
+    # all_nodes_single_layer_single_microbatch = Node._all_nodes
 
-    write_trace_to_json(list(all_nodes_single_layer_single_microbatch.values()), "trace_single_layer.json")
+    # write_trace_to_json(list(all_nodes_single_layer_single_microbatch.values()), "trace_single_layer.json")
+
+
+    construct_1f1b_schedule(B.subs(SUBSTITUTE_VALUES) // (M.subs(SUBSTITUTE_VALUES)*dp.subs(SUBSTITUTE_VALUES)))
+
+    write_trace_to_json(list(Node._all_nodes.values()), "trace_llama3.json")
+
+    print((per_layer_weight_sizes()*tp*(L-2)+2*V*D).subs(SUBSTITUTE_VALUES))
+    # per_layer_hand_caclulated = 2*D*H_k*D_h+D*H_q*D_h+D*D+3*D*D_ff
+    # print(per_layer_hand_caclulated.subs(SUBSTITUTE_VALUES))
+    # print(per_layer_hand_caclulated)
