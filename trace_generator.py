@@ -106,17 +106,18 @@ def per_layer_gradient_sizes():
     return per_layer_weight_sizes()
 
 sharding_formulas = {
-    "fwd_cp_all_gather_k" : M*S/cp*H_k/tp*D_h,
-    "fwd_cp_all_gather_v" : M*S/cp*H_k/tp*D_h,
+    "fwd_cp_all_gather_k" : M*S*H_k/tp*D_h,
+    "fwd_cp_all_gather_v" : M*S*H_k/tp*D_h,
     "fwd_tp_all_reduce_attn" : M*S/cp*D,
     "fwd_tp_all_reduce_ffn" : M*S/cp*D,
     "fwd_fsdp_all_gather" : per_layer_weight_sizes(),
     "bwd_tp_all_reduce_ffn" : M*S/cp*D,
-    "bwd_cp_reduce_scatter_k" : M*S/cp*H_k/tp*D_h,
-    "bwd_cp_reduce_scatter_v" : M*S/cp*H_k/tp*D_h,
+    "bwd_cp_reduce_scatter_k" : M*S*H_k/tp*D_h,
+    "bwd_cp_reduce_scatter_v" : M*S*H_k/tp*D_h,
     "bwd_tp_all_reduce_attn" : M*S/cp*D,
     "bwd_fsdp_reduce_scatter" : per_layer_gradient_sizes(),
-    "bwd_cp_all_reduce" : per_layer_gradient_sizes(),
+    "bwd_cp_all_reduce" : per_layer_gradient_sizes()/dp,
+    "pipeline_transfer" : M*S/cp*D
 }
 
 
@@ -587,7 +588,7 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
                 "SEND_RECV",
                 f"mb{microbatch_id}.pipeline_stage{i-1}_to_{i}.fwd.send_recv",
                 comm_group,
-                0,  # Assuming size is 0 for SEND/RECV nodes; adjust if needed
+                sharding_formulas["pipeline_transfer"].subs(SUBSTITUTE_VALUES),
                 [fwd_stages[i-1][1].id]  # Depends on the post_pipeline_sync of the previous stage
             )
             fwd_send_recv_nodes.append(send_recv_node)
@@ -610,7 +611,7 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
                 "SEND_RECV",
                 f"mb{microbatch_id}.pipeline_stage{i}_to_{i-1}.bwd.send_recv",
                 comm_group,
-                0,  # Assuming size is 0 for SEND/RECV nodes; adjust if needed
+                sharding_formulas["pipeline_transfer"].subs(SUBSTITUTE_VALUES),
                 [bwd_stages[i][1].id]  # Depends on the post_pipeline_sync of the current stage
             )
             bwd_send_recv_nodes.append(send_recv_node)
@@ -838,7 +839,12 @@ def check_divisibility():
     assert (global_batch_size // DP) % microbatch_size == 0, f"Batch size {global_batch_size} // data parallelism {DP} = {global_batch_size//DP} is not divisible by microbatches {microbatch_size}"
     #Number of layers should be divisible by PP
     assert num_layers % PP == 0, f"Number of layers {num_layers} is not divisible by pipeline parallelism {PP}"
-
+    #H_k should be divisible by TP
+    assert H_k.subs(SUBSTITUTE_VALUES) % TP == 0, f"Attention head size {H_k.subs(SUBSTITUTE_VALUES)} is not divisible by tensor parallelism {TP}"
+    #D_ff should be divisible by TP
+    assert D_ff.subs(SUBSTITUTE_VALUES) % TP == 0, f"Feedforward dimension {D_ff.subs(SUBSTITUTE_VALUES)} is not divisible by tensor parallelism {TP}"
+    #S should be divisible by CP
+    assert S.subs(SUBSTITUTE_VALUES) % CP == 0, f"Sequence length {S.subs(SUBSTITUTE_VALUES)} is not divisible by sequence parallelism {CP}"
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate a analytical model compatible DAG from model and training config")
