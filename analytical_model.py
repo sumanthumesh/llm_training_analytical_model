@@ -67,25 +67,77 @@ class LinkManager:
         changed.succeed()
 
 
-def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbose: bool):
+def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbose: bool, track_overlap: bool):
     node = graph.nodes[node_id]
     deps = list(graph.predecessors(node_id))
     if deps:
         yield simpy.AllOf(env, [done_events[dep] for dep in deps])
 
     links = yield from link_manager.acquire(node["hop_candidates"])
+    if track_overlap:
+        node["start_time"] = env.now
     if verbose:
         print(f"{env.now:12.9f}  issue    {node_id:>3}  {node['subtype']:<14} {node['name']}")
 
     yield env.timeout(node["duration"])
 
     link_manager.release(links)
+    if track_overlap:
+        node["end_time"] = env.now
     if verbose:
         print(f"{env.now:12.9f}  complete {node_id:>3}  {node['subtype']:<14} {node['name']}")
     done_events[node_id].succeed()
 
 
-def simulate(topo: Topology, graph, peak_perf_tflops: float, local_mem_bw_gbps: float, verbose: bool = True) -> float:
+def classify_overlap(graph) -> dict[str, float]:
+    """Breaks the simulated timeline into exposed-compute, exposed-comm,
+    overlapped (both active), and idle (neither active) time, via a sweep
+    over COMP/COMM node start/end events. Requires simulate(...,
+    track_overlap=True) to have populated start_time/end_time on every node
+    -- SYNC/DUMMY nodes are zero-duration and excluded, they never affect
+    this either way.
+    """
+    events = []
+    for _, node in graph.nodes(data=True):
+        if node["type"] not in ("COMP", "COMM"):
+            continue
+        events.append((node["start_time"], 1, node["type"]))
+        events.append((node["end_time"], -1, node["type"]))
+    if not events:
+        return {"exposed_comp": 0.0, "exposed_comm": 0.0, "overlapped": 0.0, "idle": 0.0}
+    events.sort(key=lambda e: (e[0], e[1]))  # ends (-1) before starts (+1) at equal timestamps
+
+    comp_active = comm_active = 0
+    last_t = events[0][0]
+    exposed_comp = exposed_comm = overlapped = idle = 0.0
+
+    for t, delta, kind in events:
+        dt = t - last_t
+        if comp_active and comm_active:
+            overlapped += dt
+        elif comp_active:
+            exposed_comp += dt
+        elif comm_active:
+            exposed_comm += dt
+        else:
+            idle += dt
+        if kind == "COMP":
+            comp_active += delta
+        else:
+            comm_active += delta
+        last_t = t
+
+    return {"exposed_comp": exposed_comp, "exposed_comm": exposed_comm, "overlapped": overlapped, "idle": idle}
+
+
+def simulate(
+    topo: Topology,
+    graph,
+    peak_perf_tflops: float,
+    local_mem_bw_gbps: float,
+    verbose: bool = True,
+    track_overlap: bool = False,
+) -> float:
     routing_table = build_routing_table(topo)
     for node_id, node in graph.nodes(data=True):
         node["hop_candidates"], node["duration"] = precompute_node(
@@ -97,7 +149,7 @@ def simulate(topo: Topology, graph, peak_perf_tflops: float, local_mem_bw_gbps: 
     done_events = {node_id: env.event() for node_id in graph.nodes}
 
     for node_id in graph.nodes:
-        env.process(run_node(env, node_id, graph, link_manager, done_events, verbose))
+        env.process(run_node(env, node_id, graph, link_manager, done_events, verbose, track_overlap))
 
     env.run()
     return env.now
@@ -110,13 +162,23 @@ if __name__ == "__main__":
     parser.add_argument("--peak-perf", type=float, required=True, help="Peak compute performance in TFLOPS, for COMP node roofline timing.")
     parser.add_argument("--local-mem-bw", type=float, required=True, help="Local memory bandwidth in GB/s, for COMP node roofline timing.")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node issue/complete logging.")
+    parser.add_argument("--overlap", action="store_true", help="Track and report exposed-compute/exposed-comm/overlapped/idle time breakdown.")
     args = parser.parse_args()
 
     physical_topology = parse_edgelist(args.topology)
     # draw_topology(physical_topology, "topology.png")
 
     dag = load_trace(args.trace)
-    finish_time = simulate(physical_topology, dag, args.peak_perf, args.local_mem_bw, verbose=not args.quiet)
+    finish_time = simulate(
+        physical_topology, dag, args.peak_perf, args.local_mem_bw, verbose=not args.quiet, track_overlap=args.overlap
+    )
     print(f"\nSimulation finished at t={finish_time:.9f}s")
+
+    if args.overlap:
+        breakdown = classify_overlap(dag)
+        print(f"Exposed compute: {breakdown['exposed_comp']:.9f}s")
+        print(f"Exposed comm:    {breakdown['exposed_comm']:.9f}s")
+        print(f"Overlapped:      {breakdown['overlapped']:.9f}s")
+        print(f"Idle:            {breakdown['idle']:.9f}s")
 
     
