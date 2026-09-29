@@ -27,7 +27,7 @@ def generate_edgelist(
     multi_domain = num_domains > 1
     spine = f"s{num_domains}"
     num_switches = num_domains + (1 if multi_domain else 0)
-    num_links = num_hosts + (num_domains if multi_domain else 0)
+    num_links = num_hosts + (num_hosts if multi_domain else 0)
 
     lines = [
         f"# {npus_per_domain} NPUs/domain x {num_domains} domain(s)",
@@ -59,10 +59,10 @@ def generate_edgelist(
         for local_idx in range(npus_per_domain):
             host = domain * npus_per_domain + local_idx
             lines.append(f"link h{host} {leaf}")
-        if multi_domain:
-            lines.append(
-                f"link {leaf} {spine} speed_Gbps {outer_bandwidth_gbps} latency_ns {outer_latency_ns}"
-            )
+            if multi_domain:
+                lines.append(
+                    f"link h{host} {spine} speed_Gbps {outer_bandwidth_gbps} latency_ns {outer_latency_ns}"
+                )
 
     return "\n".join(lines) + "\n"
 
