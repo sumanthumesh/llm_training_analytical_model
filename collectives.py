@@ -62,7 +62,6 @@ def precompute_node(node: dict, routing_table: RoutingTable) -> tuple[HopCandida
     elif subtype in ("ALL_GATHER", "REDUCE_SCATTER"):
         # Ring algorithm: N-1 steps, each moving a 1/N chunk to the next rank.
         hop_candidates = [routing_table[a, b] for a, b in ring_hops(hosts)]
-        print(f"hop_candidates: {hop_candidates}")
         duration = (n - 1) * step_time(hop_candidates, size_bytes / n)
 
     elif subtype == "ALL_REDUCE":
