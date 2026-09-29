@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import simpy
 
@@ -130,6 +131,46 @@ def classify_overlap(graph) -> dict[str, float]:
     return {"exposed_comp": exposed_comp, "exposed_comm": exposed_comm, "overlapped": overlapped, "idle": idle}
 
 
+def write_perfetto_trace(graph, filepath: str) -> None:
+    """Writes a Chrome Trace Event Format JSON, openable at ui.perfetto.dev
+    or chrome://tracing. Requires simulate(..., track_overlap=True) to have
+    populated start_time/end_time on every node.
+
+    Two tracks (tid), matching classify_overlap's own categories: COMP and
+    COMM. This isn't a full per-NPU Gantt chart -- COMP nodes don't carry a
+    rank/NPU id the way COMM nodes' comm_group does (compute isn't replicated
+    per physical rank in the trace, see trace_generator.py), so there's no
+    per-rank track to assign them to yet. SYNC/DUMMY nodes are zero-duration
+    and omitted -- they never contribute to "where does the time go," which
+    is the point of this view.
+    """
+    track_tids = {"COMP": 0, "COMM": 1}
+    events = [{"name": "process_name", "ph": "M", "pid": 0, "args": {"name": "analytical_model"}}]
+    for node_type, tid in track_tids.items():
+        events.append({"name": "thread_name", "ph": "M", "pid": 0, "tid": tid, "args": {"name": node_type}})
+
+    for node_id, node in graph.nodes(data=True):
+        if node["type"] not in track_tids:
+            continue
+        events.append({
+            "name": node["name"],
+            "cat": node["subtype"],
+            "ph": "X",
+            "ts": node["start_time"] * 1e6,  # sec -> usec, Chrome trace format's unit
+            "dur": (node["end_time"] - node["start_time"]) * 1e6,
+            "pid": 0,
+            "tid": track_tids[node["type"]],
+            "args": {
+                "id": node_id,
+                "comm_group": node.get("comm_group", []),
+                "size": node.get("size", 0),
+            },
+        })
+
+    with open(filepath, "w") as f:
+        json.dump({"traceEvents": events}, f)
+
+
 def simulate(
     topo: Topology,
     graph,
@@ -163,14 +204,16 @@ if __name__ == "__main__":
     parser.add_argument("--local-mem-bw", type=float, required=True, help="Local memory bandwidth in GB/s, for COMP node roofline timing.")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node issue/complete logging.")
     parser.add_argument("--overlap", action="store_true", help="Track and report exposed-compute/exposed-comm/overlapped/idle time breakdown.")
+    parser.add_argument("--perfetto-trace", type=str, default=None, help="Write a Perfetto/Chrome-trace-format JSON to this path (open at ui.perfetto.dev).")
     args = parser.parse_args()
 
     physical_topology = parse_edgelist(args.topology)
     # draw_topology(physical_topology, "topology.png")
 
     dag = load_trace(args.trace)
+    track_overlap = args.overlap or args.perfetto_trace is not None
     finish_time = simulate(
-        physical_topology, dag, args.peak_perf, args.local_mem_bw, verbose=not args.quiet, track_overlap=args.overlap
+        physical_topology, dag, args.peak_perf, args.local_mem_bw, verbose=not args.quiet, track_overlap=track_overlap
     )
     print(f"\nSimulation finished at t={finish_time:.9f}s")
 
@@ -181,4 +224,6 @@ if __name__ == "__main__":
         print(f"Overlapped:      {breakdown['overlapped']:.9f}s")
         print(f"Idle:            {breakdown['idle']:.9f}s")
 
-    
+    if args.perfetto_trace:
+        write_perfetto_trace(dag, args.perfetto_trace)
+        print(f"Wrote Perfetto trace to {args.perfetto_trace}")
