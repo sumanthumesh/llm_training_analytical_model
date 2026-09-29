@@ -25,21 +25,29 @@ B = sympy.symbols("B")
 S = sympy.symbols("S")
 M = sympy.symbols("M")
 
-SUBSTITUTE_VALUES = {
-    L: 128,
-    H_k: 8,
-    H_q: 128,
-    D_h: 128,
-    D_ff: 53248,
-    V: 128000,
-    dp: 4,
-    pp: 2,
-    cp: 1,
-    tp: 4,
-    B: 32*4,
-    S: 8192,
-    M: 16
-}
+SUBSTITUTE_VALUES = dict()
+# SUBSTITUTE_VALUES = {
+#     L: 128,
+#     H_k: 8,
+#     H_q: 128,
+#     D_h: 128,
+#     D_ff: 53248,
+#     V: 128000,
+#     dp: 4,
+#     pp: 16,
+#     cp: 1,
+#     tp: 8,
+#     B: 32*4,
+#     S: 8192,
+#     M: 2
+# }
+
+# DP/PP/CP/TP/etc. below and RESOLVED_SHARDING_FORMULAS further down are
+# resolved by resolve_constants(), called once SUBSTITUTE_VALUES has actually
+# been populated (see __main__) -- SUBSTITUTE_VALUES starts empty now that
+# it's filled in from CLI args rather than hardcoded here, so resolving them
+# eagerly at module-load time, before argparse has even run, doesn't work
+# (there's nothing to substitute yet).
 
 MAX_COMM_GROUPS_PER_COMM = 1
 
@@ -131,19 +139,36 @@ sharding_formulas = {
     "pipeline_transfer" : M*S/cp*D
 }
 
+def resolve_constants():
+    """(Re)computes the plain-int module constants (DP/PP/CP/TP/...) and
+    RESOLVED_SHARDING_FORMULAS from the current SUBSTITUTE_VALUES. Must be
+    called once SUBSTITUTE_VALUES is fully populated -- from CLI args, see
+    __main__ -- and before any trace generation, since every generation
+    function reads these as globals rather than resolving them itself: doing
+    the sympy .subs() substitution once here instead of inside every function
+    (node_id_from_axes alone used to do it tens of thousands of times per
+    run) is what keeps generation fast. See git history if you need the
+    reasoning spelled out further.
+    """
+    global DP, PP, CP, TP, NUM_LAYERS, GLOBAL_BATCH_SIZE, MICROBATCH_SIZE, NUM_MICROBATCHES, RESOLVED_SHARDING_FORMULAS
+    DP = int(dp.subs(SUBSTITUTE_VALUES))
+    PP = int(pp.subs(SUBSTITUTE_VALUES))
+    CP = int(cp.subs(SUBSTITUTE_VALUES))
+    TP = int(tp.subs(SUBSTITUTE_VALUES))
+    NUM_LAYERS = int(L.subs(SUBSTITUTE_VALUES))
+    GLOBAL_BATCH_SIZE = int(B.subs(SUBSTITUTE_VALUES))
+    MICROBATCH_SIZE = int(M.subs(SUBSTITUTE_VALUES))
+    NUM_MICROBATCHES = GLOBAL_BATCH_SIZE // (MICROBATCH_SIZE * DP)
+    RESOLVED_SHARDING_FORMULAS = {key: formula.subs(SUBSTITUTE_VALUES) for key, formula in sharding_formulas.items()}
+
 
 
 def pipeline_stage_from_layer_id(layer_id:int,num_layers:int) -> int:
-    num_pipeline_stages = pp.subs(SUBSTITUTE_VALUES)
-    layers_per_stage = num_layers // num_pipeline_stages
+    layers_per_stage = num_layers // PP
     return layer_id // layers_per_stage
 
 # def node_id_from_axes(d,c=0,p=0,t=0):
 def node_id_from_axes(dims):
-    DP=dp.subs(SUBSTITUTE_VALUES)
-    PP=pp.subs(SUBSTITUTE_VALUES)
-    CP=cp.subs(SUBSTITUTE_VALUES)
-    TP=tp.subs(SUBSTITUTE_VALUES)
     #All inputs are lists or arrays
     c = dims[1]
     p = dims[2]
@@ -152,11 +177,6 @@ def node_id_from_axes(dims):
     return d*PP*CP*TP + p*CP*TP + c*TP + t
 
 def axes_from_node_id(node_id:int):
-    DP=dp.subs(SUBSTITUTE_VALUES)
-    PP=pp.subs(SUBSTITUTE_VALUES)
-    CP=cp.subs(SUBSTITUTE_VALUES)
-    TP=tp.subs(SUBSTITUTE_VALUES)
-
     d = node_id // (PP*CP*TP)
     p = (node_id % (PP*CP*TP)) // (CP*TP)
     c = (node_id % (CP*TP)) // TP
@@ -165,10 +185,6 @@ def axes_from_node_id(node_id:int):
     return d,p,c,t
 
 def get_pp_transfer_comm_groups(from_stage:int,to_stage:int):
-    TP=tp.subs(SUBSTITUTE_VALUES)
-    DP=dp.subs(SUBSTITUTE_VALUES)
-    CP=cp.subs(SUBSTITUTE_VALUES)
-
     comm_group_coords = []
 
     for d in range(DP):
@@ -181,12 +197,6 @@ def get_pp_transfer_comm_groups(from_stage:int,to_stage:int):
 
 
 def permute_axes(d:int,c:int,p:int,t:int)->List[List[int]]:
-    DP=dp.subs(SUBSTITUTE_VALUES)
-    CP=cp.subs(SUBSTITUTE_VALUES)
-    PP=pp.subs(SUBSTITUTE_VALUES)
-    TP=tp.subs(SUBSTITUTE_VALUES)
-
-
     @dataclass
     class Axis:
         name:str = ""
@@ -244,10 +254,7 @@ def permute_axes(d:int,c:int,p:int,t:int)->List[List[int]]:
 def single_layer_forward_pass(layer_id,microbatch_id):
     #FSDP fetch is outside the scope of this function
 
-    pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES))
-    DP=dp.subs(SUBSTITUTE_VALUES)
-    CP=cp.subs(SUBSTITUTE_VALUES)
-    TP=tp.subs(SUBSTITUTE_VALUES)
+    pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,NUM_LAYERS)
 
     pre_layer_sync_node = Node(
         "SYNC",
@@ -267,7 +274,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
                 "ALL_GATHER",
                 f"mb{microbatch_id}.layer{layer_id}.fwd.fsdp_all_gather",
                 comm_group,
-                sharding_formulas["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES),
+                RESOLVED_SHARDING_FORMULAS["fwd_fsdp_all_gather"],
                 [pre_layer_sync_node.id],
                 degree=DP
             )
@@ -293,7 +300,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             "ALL_GATHER",
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.k",
             comm_group,
-            sharding_formulas["fwd_cp_all_gather_k"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_k"],
             [post_fsdp_sync_node.id],
             degree=CP
         )
@@ -301,7 +308,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             "ALL_GATHER",
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.v",
             comm_group,
-            sharding_formulas["fwd_cp_all_gather_v"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_v"],
             [post_fsdp_sync_node.id],
             degree=CP
         )
@@ -324,7 +331,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.attn",
             comm_group,
-            sharding_formulas["fwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["fwd_tp_all_reduce_attn"],
             [cp_all_gather_sync_node.id],
             degree=TP
         )
@@ -345,7 +352,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.ffn",
             comm_group,
-            sharding_formulas["fwd_tp_all_reduce_ffn"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["fwd_tp_all_reduce_ffn"],
             [tp_all_reduce_attn_sync_node.id],
             degree=TP
         )
@@ -364,10 +371,6 @@ def single_layer_forward_pass(layer_id,microbatch_id):
 
 def single_layer_backward_pass(layer_id,microbatch_id):
     #FSDP reduce scatter is outside the scope of this function
-    DP=dp.subs(SUBSTITUTE_VALUES)
-    CP=cp.subs(SUBSTITUTE_VALUES)
-    TP=tp.subs(SUBSTITUTE_VALUES)
-
     pre_layer_sync_node = Node(
         "SYNC",
         "PRE_LAYER",
@@ -377,14 +380,14 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         []
     )
 
-    tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-2)
+    tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-2)
     tp_all_reduce_ffn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
         all_reduce_ffn = make_comm_node(
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.ffn",
             comm_group,
-            sharding_formulas["bwd_tp_all_reduce_ffn"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_ffn"],
             [pre_layer_sync_node.id],
             degree=TP
         )
@@ -399,14 +402,14 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         [node.id for node in tp_all_reduce_ffn_nodes]
     )
 
-    cp_reduce_scatter_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
+    cp_reduce_scatter_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-1)
     cp_reduce_scatter_nodes = []
     for comm_group in cp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_reduce_scatter_comm_groups))]:
         reduce_scatter_k = make_comm_node(
             "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.k",
             comm_group,
-            sharding_formulas["bwd_cp_reduce_scatter_k"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_k"],
             [tp_all_reduce_ffn_sync_node.id],
             degree=CP
         )
@@ -414,7 +417,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.v",
             comm_group,
-            sharding_formulas["bwd_cp_reduce_scatter_v"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_v"],
             [tp_all_reduce_ffn_sync_node.id],
             degree=CP
         )
@@ -438,7 +441,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.attn",
             comm_group,
-            sharding_formulas["bwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES),
+            RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_attn"],
             [cp_reduce_scatter_sync_node.id],
             degree=TP
         )
@@ -456,18 +459,18 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     #If this is the last microbatch, then current gradients are dp,cp sharded
     #I'm assuming FSDP is only across DP. So we will need to do reduce_scatter across DP followed by all_reduce across CP
 
-    num_microbatches = B.subs(SUBSTITUTE_VALUES) // (M.subs(SUBSTITUTE_VALUES)*dp.subs(SUBSTITUTE_VALUES))
+    num_microbatches = NUM_MICROBATCHES
     grad_dp_reduce_scatter_nodes = []
     grad_cp_all_reduce_nodes = []
     if microbatch_id == num_microbatches - 1:
 
-        grad_dp_reduce_scatter_comm_groups = permute_axes(-2,-1,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
+        grad_dp_reduce_scatter_comm_groups = permute_axes(-2,-1,pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-1)
         for comm_group in grad_dp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_dp_reduce_scatter_comm_groups))]:
             grad_reduce_scatter = make_comm_node(
                 "REDUCE_SCATTER",
                 f"mb{microbatch_id}.layer{layer_id}.bwd.grad_dp_reduce_scatter",
                 comm_group,
-                sharding_formulas["bwd_fsdp_reduce_scatter"].subs(SUBSTITUTE_VALUES),
+                RESOLVED_SHARDING_FORMULAS["bwd_fsdp_reduce_scatter"],
                 [tp_all_reduce_attn_sync_node.id],
                 degree=DP
             )
@@ -482,13 +485,13 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             [node.id for node in grad_dp_reduce_scatter_nodes]
         )
 
-        grad_cp_all_reduce_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
+        grad_cp_all_reduce_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-1)
         for comm_group in grad_cp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_cp_all_reduce_comm_groups))]:
             grad_all_reduce = make_comm_node(
                 "ALL_REDUCE",
                 f"mb{microbatch_id}.layer{layer_id}.bwd.grad_cp_all_reduce",
                 comm_group,
-                sharding_formulas["bwd_cp_all_reduce"].subs(SUBSTITUTE_VALUES),
+                RESOLVED_SHARDING_FORMULAS["bwd_cp_all_reduce"],
                 [grad_dp_reduce_scatter_sync_node.id],
                 degree=CP
             )
@@ -506,7 +509,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     return [pre_layer_sync_node,post_layer_sync_node]
 
 def forward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
-    print(f"Received layer_ids for forward pass({pipeline_stage_id}): {layer_ids}")
+    # print(f"Received layer_ids for forward pass({pipeline_stage_id}): {layer_ids}")
     layers = []
     L = len(layer_ids)
     for layer_id in layer_ids:
@@ -528,7 +531,7 @@ def forward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
     #Wire the layers together by connecting this layers pre_layer_sync to previous layers post_layer_sync
     #For example, connect layer 14's pre_layer_sync to layer 15's post_layer_sync
     for layer_id in layer_ids[1:]:
-        print(f"L;{layer_id}/{layer_id%L} -> L-1;{layer_id-1}/{layer_id%L-1}")
+        # print(f"L;{layer_id}/{layer_id%L} -> L-1;{layer_id-1}/{layer_id%L-1}")
         layers[layer_id%L][0].deps.append(layers[layer_id%L-1][1].id)
 
     post_pipeline_sync_node = Node(
@@ -544,7 +547,7 @@ def forward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
 
 def backward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
     #I am expecting layer ids to already be in reverse order like [15,14,13,12]
-    print(f"Received layer_ids for backward pass({pipeline_stage_id}): {layer_ids}")
+    # print(f"Received layer_ids for backward pass({pipeline_stage_id}): {layer_ids}")
     layers = []
     L=len(layer_ids)
     for layer_id in layer_ids:
@@ -566,8 +569,8 @@ def backward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
     #Wire the layers by connecting current layers this layers all_reduce_ffn to previous layers all_reduce_attn
     #For example, connect layer 14's all_reduce_ffn to layer 15's all_reduce_attn
     for layer_id in layer_ids[1:]:
-        print(f"L;{layer_id+1}/{layer_id%L+1} -> L;{layer_id}/{layer_id%L}")
-        print(f"Connecting layer {layer_id%L+1}'s post_layer_sync to layer {layer_id%L}'s pre_layer_sync")
+        # print(f"L;{layer_id+1}/{layer_id%L+1} -> L;{layer_id}/{layer_id%L}")
+        # print(f"Connecting layer {layer_id%L+1}'s post_layer_sync to layer {layer_id%L}'s pre_layer_sync")
         layers[layer_id%L+1][0].deps.append(layers[layer_id%L][1].id)
 
     #Add a post pipeline sync
@@ -583,7 +586,8 @@ def backward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
     return pre_pipeline_sync_node, post_pipeline_sync_node
 
 def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
-    num_pipeline_stages = pp.subs(SUBSTITUTE_VALUES)
+    print(f"Generating pipeline pass for microbatch {microbatch_id}")
+    num_pipeline_stages = PP
     layers_per_stage = num_layers // num_pipeline_stages
 
     fwd_stages:Dict[int,Tuple[Node, Node]] = dict()
@@ -602,7 +606,7 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
                 "SEND_RECV",
                 f"mb{microbatch_id}.pipeline_stage{i-1}_to_{i}.fwd.send_recv",
                 comm_group,
-                sharding_formulas["pipeline_transfer"].subs(SUBSTITUTE_VALUES),
+                RESOLVED_SHARDING_FORMULAS["pipeline_transfer"],
                 [fwd_stages[i-1][1].id]  # Depends on the post_pipeline_sync of the previous stage
             )
             fwd_send_recv_nodes.append(send_recv_node)
@@ -611,7 +615,7 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
     bwd_stages:Dict[int,Tuple[Node, Node]] = dict()
     for i in range(num_pipeline_stages):
         layer_ids = list(reversed(range((num_pipeline_stages-i-1)*layers_per_stage, (num_pipeline_stages-i)*layers_per_stage)))
-        print(f"Layer_ids:{layer_ids}")
+        # print(f"Layer_ids:{layer_ids}")
         bwd_stages[num_pipeline_stages-i-1] = backward_pipeline_stage(layer_ids,num_pipeline_stages-i-1,microbatch_id)
 
     #Wire them up
@@ -625,7 +629,7 @@ def pipeline_pass_for_single_microbatch(microbatch_id,num_layers):
                 "SEND_RECV",
                 f"mb{microbatch_id}.pipeline_stage{i}_to_{i-1}.bwd.send_recv",
                 comm_group,
-                sharding_formulas["pipeline_transfer"].subs(SUBSTITUTE_VALUES),
+                RESOLVED_SHARDING_FORMULAS["pipeline_transfer"],
                 [bwd_stages[i][1].id]  # Depends on the post_pipeline_sync of the current stage
             )
             bwd_send_recv_nodes.append(send_recv_node)
@@ -780,12 +784,12 @@ def get_pp_1f1b_schedule(num_pipeline_stages:int, num_microbatches:int):
 
 def construct_1f1b_schedule(num_microbatches:int):
     #Get the dependency chains for each PP stage
-    dependency_chains = get_pp_1f1b_schedule(pp.subs(SUBSTITUTE_VALUES), num_microbatches)
+    dependency_chains = get_pp_1f1b_schedule(PP, num_microbatches)
 
     #Generate the pipeline pass for each microbatch
     microbatch_passes:Dict[int,Tuple[Dict[int,Tuple[Node, Node]], Dict[int,Tuple[Node, Node]]]] = {}
     for microbatch_id in range(num_microbatches):
-        microbatch_passes[microbatch_id] = pipeline_pass_for_single_microbatch(microbatch_id, L.subs(SUBSTITUTE_VALUES))
+        microbatch_passes[microbatch_id] = pipeline_pass_for_single_microbatch(microbatch_id, NUM_LAYERS)
 
     #Wire up according to microbatch dependency chains
     for pp_stage_id,chain in dependency_chains.items():
@@ -863,6 +867,20 @@ def check_divisibility():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate a analytical model compatible DAG from model and training config")
     parser.add_argument("--single-comm", "-s", action="store_true", help="Generate a single comm group for all communication operations")
+    parser.add_argument("--layers", "-l", type=int, default=128, help="Number of layers in the model")
+    parser.add_argument("--kv-heads",type=int,default=8,help="Number of key/value heads in the model")
+    parser.add_argument("--q-heads",type=int,default=128,help="Number of query heads in the model")
+    parser.add_argument("--head-dim",type=int,default=128,help="Dimension of each attention head")
+    parser.add_argument("--ffn-dim",type=int,default=53248,help="Feedforward dimension in the model")
+    parser.add_argument("--vocab",type=int,default=128000,help="Vocabulary size")
+    parser.add_argument("--seq-len",type=int,default=8192,help="Sequence length")
+    parser.add_argument("--batch-size",type=int,default=32*4,help="Global batch size")
+    parser.add_argument("--microbatch-size",type=int,default=2,help="Microbatch size")
+    parser.add_argument("--dp",type=int,default=4,help="Data parallelism degree")
+    parser.add_argument("--cp",type=int,default=1,help="Sequence parallelism degree")
+    parser.add_argument("--pp",type=int,default=4,help="Pipeline parallelism degree")
+    parser.add_argument("--tp",type=int,default=8,help="Tensor parallelism degree")
+    parser.add_argument("--output","-o",type=str,default="trace.json",help="Output file path for the generated trace JSON")
 
     #I'm fixing the ordering for sharding axes based on how deep inside the model they are located
     #dp replicates entire model
@@ -870,6 +888,24 @@ if __name__ == '__main__':
     #pp happens at multi layer level
     #tp and ep happen at sublayer level
     args = parser.parse_args()
+
+    SUBSTITUTE_VALUES = {
+        L: args.layers,
+        H_k: args.kv_heads,
+        H_q: args.q_heads,
+        D_h: args.head_dim,
+        D_ff: args.ffn_dim,
+        V: args.vocab,
+        S: args.seq_len,
+        B: args.batch_size,
+        M: args.microbatch_size,
+        dp: args.dp,
+        cp: args.cp,
+        pp: args.pp,
+        tp: args.tp
+    }
+    resolve_constants()
+
     if args.single_comm:
         MAX_COMM_GROUPS_PER_COMM = 1
     else:
@@ -879,6 +915,8 @@ if __name__ == '__main__':
     sharding_axes = [s.subs(SUBSTITUTE_VALUES) for s in sharding_axes_symbols]
 
     check_divisibility()
+
+    print(f"NUM NPUS: {(tp*pp*cp*dp).subs(SUBSTITUTE_VALUES)}")
 
     # fwd_layers = forward_pipeline_stage([0,1,2,3],0,0)
     # bwd_layers = backward_pipeline_stage([3,2,1,0],0,0)
@@ -894,9 +932,9 @@ if __name__ == '__main__':
     # write_trace_to_json(list(all_nodes_single_layer_single_microbatch.values()), "trace_single_layer.json")
 
 
-    construct_1f1b_schedule(B.subs(SUBSTITUTE_VALUES) // (M.subs(SUBSTITUTE_VALUES)*dp.subs(SUBSTITUTE_VALUES)))
+    construct_1f1b_schedule(NUM_MICROBATCHES)
 
-    write_trace_to_json(list(Node._all_nodes.values()), "trace_llama3.json")
+    write_trace_to_json(list(Node._all_nodes.values()), args.output)
 
     print((per_layer_weight_sizes()*tp*(L-2)+2*V*D).subs(SUBSTITUTE_VALUES))
     # per_layer_hand_caclulated = 2*D*H_k*D_h+D*H_q*D_h+D*D+3*D*D_ff
