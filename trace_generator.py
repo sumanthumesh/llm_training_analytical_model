@@ -50,6 +50,9 @@ SUBSTITUTE_VALUES = dict()
 # (there's nothing to substitute yet).
 
 MAX_COMM_GROUPS_PER_COMM = 1
+#Bytes per element for MatMul.tensor_size_numeric -- 2 (bf16/fp16) is the
+#de facto default training precision; overridden from --bytes-per-element.
+BYTES_PER_ELEMENT = 2
 
 @dataclass
 class Node:
@@ -145,6 +148,8 @@ class MatMul:
     output:List[sympy.Expr]
     FLOPs:sympy.Expr = field(init=False)
     FLOPs_numeric:int = field(init=False)
+    tensor_size:sympy.Expr = field(init=False)
+    tensor_size_numeric:int = field(init=False)
 
     def __post_init__(self):
         #Every contracting dim must actually be shared by both operands -- an
@@ -160,6 +165,14 @@ class MatMul:
         #RESOLVED_SHARDING_FORMULAS, computed once here rather than by every
         #caller that wants an actual number instead of the symbolic formula.
         self.FLOPs_numeric = int(self.FLOPs.subs(SUBSTITUTE_VALUES))
+        #Total element count moved for this op -- inputA + inputB + output,
+        #each its own product (not a union: unlike FLOPs, a dim shared between
+        #operands still occupies real memory in both, so it's counted twice).
+        #Stays in elements, precision-agnostic, like a shape; the numeric
+        #version below is where a concrete dtype width gets applied, for the
+        #roofline model's memory-bound term (bytes_moved / bandwidth).
+        self.tensor_size = sympy.prod(self.inputA) + sympy.prod(self.inputB) + sympy.prod(self.output)
+        self.tensor_size_numeric = int(self.tensor_size.subs(SUBSTITUTE_VALUES)) * BYTES_PER_ELEMENT
 
     def __str__(self):
         return f"[{','.join(str(x) for x in self.inputA)}] x [{','.join(str(x) for x in self.inputB)}] -> [{','.join(str(x) for x in self.output)}]"
@@ -982,6 +995,8 @@ def matmul_to_json(matmul:MatMul) -> Dict:
         "output": [str(dim) for dim in matmul.output],
         "FLOPs": str(matmul.FLOPs),
         "FLOPs_numeric": matmul.FLOPs_numeric,
+        "tensor_size": str(matmul.tensor_size),
+        "tensor_size_numeric": matmul.tensor_size_numeric,
     }
 
 def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
@@ -1046,6 +1061,7 @@ if __name__ == '__main__':
     parser.add_argument("--pp",type=int,default=4,help="Pipeline parallelism degree")
     parser.add_argument("--tp",type=int,default=8,help="Tensor parallelism degree")
     parser.add_argument("--output","-o",type=str,default="trace.json",help="Output file path for the generated trace JSON")
+    parser.add_argument("--bytes-per-element",type=int,default=2,help="Bytes per element for MatMul tensor sizes (default: 2, bf16/fp16)")
 
     #I'm fixing the ordering for sharding axes based on how deep inside the model they are located
     #dp replicates entire model
@@ -1075,6 +1091,8 @@ if __name__ == '__main__':
         MAX_COMM_GROUPS_PER_COMM = 1
     else:
         MAX_COMM_GROUPS_PER_COMM = 1000000
+
+    BYTES_PER_ELEMENT = args.bytes_per_element
 
     sharding_axes_symbols = [dp,cp,pp,tp]
     sharding_axes = [s.subs(SUBSTITUTE_VALUES) for s in sharding_axes_symbols]
