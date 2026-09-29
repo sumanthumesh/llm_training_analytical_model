@@ -214,7 +214,7 @@ def main():
     parser.add_argument("--show", action="store_true", help="Show the plot interactively.")
     args = parser.parse_args()
 
-    graph, _comm_groups = load_trace(args.trace)
+    graph = load_trace(args.trace)
     print(f"Nodes: {graph.number_of_nodes()}, Edges: {graph.number_of_edges()}")
     if not nx.is_directed_acyclic_graph(graph):
         cycle = nx.find_cycle(graph)
