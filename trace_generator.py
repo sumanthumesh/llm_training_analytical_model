@@ -321,7 +321,7 @@ def permute_axes(d:int,c:int,p:int,t:int)->List[List[int]]:
 
     return npu_id_matrix.tolist()
 
-def single_layer_forward_pass(layer_id,microbatch_id):
+def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
     #FSDP fetch is outside the scope of this function
 
     pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,NUM_LAYERS)
@@ -339,13 +339,21 @@ def single_layer_forward_pass(layer_id,microbatch_id):
     fsdp_all_gather_nodes = []
     if microbatch_id == 0:
         fsdp_all_gather_comm_groups = permute_axes(-2,-1,pipeline_stage_id,-1)
+        #Prefetch: gather THIS layer's weights while the PREVIOUS layer is still
+        #computing, instead of waiting for this layer's own pre_layer_sync --
+        #bounded to exactly one layer ahead, matching llm_dense_full_pass.tex's
+        #PF_{p,m} pseudocode (gathers l+1's weights concurrently with F_{l,m}).
+        #The first layer of a stage has no earlier layer to overlap with, so
+        #the caller leaves prefetch_dep_node_id unset and it falls back to
+        #this layer's own pre_layer_sync, same as before this change.
+        gather_dep_id = prefetch_dep_node_id if prefetch_dep_node_id is not None else pre_layer_sync_node.id
         for comm_group in fsdp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(fsdp_all_gather_comm_groups))]:
             all_gather = make_comm_node(
                 "ALL_GATHER",
                 f"mb{microbatch_id}.layer{layer_id}.fwd.fsdp_all_gather",
                 comm_group,
                 RESOLVED_SHARDING_FORMULAS["fwd_fsdp_all_gather"],
-                [pre_layer_sync_node.id],
+                [gather_dep_id],
                 degree=DP
             )
             fsdp_all_gather_nodes.append(all_gather)
@@ -695,8 +703,12 @@ def forward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
     # print(f"Received layer_ids for forward pass({pipeline_stage_id}): {layer_ids}")
     layers = []
     L = len(layer_ids)
+    prefetch_dep_node_id = None
     for layer_id in layer_ids:
-        layers.append(single_layer_forward_pass(layer_id,microbatch_id))
+        layer_nodes = single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id)
+        layers.append(layer_nodes)
+        #Next layer's fsdp_all_gather prefetches against THIS layer's start.
+        prefetch_dep_node_id = layer_nodes[0].id
 
     #Add a pre pipeline sync
     pre_pipeline_sync_node = Node(
