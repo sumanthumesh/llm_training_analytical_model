@@ -1,4 +1,5 @@
 import argparse
+import functools
 import os
 import sys
 import json
@@ -139,6 +140,21 @@ def per_layer_gradient_sizes():
     #Assuming grdient size is same as weight size
     return per_layer_weight_sizes()
 
+#Memoizes (str(expr), int(expr.subs(SUBSTITUTE_VALUES))) by expression. A
+#full trace constructs thousands of MatMuls, but there are only a few dozen
+#distinct FLOPs/tensor_size formulas among them -- the same shapes recur
+#identically on every layer and every microbatch -- so without this, both
+#sympy's .subs() (real symbolic-tree substitution, not a dict lookup) and its
+#str() printer (also real tree-walking work) get redone thousands of times
+#over for answers that were already computed. This was the dominant cost in
+#trace generation once per-matmul comps were added.
+_MATMUL_EXPR_CACHE:Dict[sympy.Expr, Tuple[str,int]] = {}
+
+def _resolve_expr(expr:sympy.Expr) -> Tuple[str,int]:
+    if expr not in _MATMUL_EXPR_CACHE:
+        _MATMUL_EXPR_CACHE[expr] = (str(expr), int(expr.subs(SUBSTITUTE_VALUES)))
+    return _MATMUL_EXPR_CACHE[expr]
+
 @dataclass
 class MatMul:
     name:str
@@ -147,8 +163,10 @@ class MatMul:
     contracting_dims:List[sympy.Expr]
     output:List[sympy.Expr]
     FLOPs:sympy.Expr = field(init=False)
+    FLOPs_str:str = field(init=False)
     FLOPs_numeric:int = field(init=False)
     tensor_size:sympy.Expr = field(init=False)
+    tensor_size_str:str = field(init=False)
     tensor_size_numeric:int = field(init=False)
 
     def __post_init__(self):
@@ -161,10 +179,7 @@ class MatMul:
         #their union, so this is exactly 2 * output_size * contracted_size --
         #one multiply and one add per MAC -- without needing output at all.
         self.FLOPs = 2 * sympy.prod(set(self.inputA) | set(self.inputB))
-        #Resolved against the current SUBSTITUTE_VALUES -- same as
-        #RESOLVED_SHARDING_FORMULAS, computed once here rather than by every
-        #caller that wants an actual number instead of the symbolic formula.
-        self.FLOPs_numeric = int(self.FLOPs.subs(SUBSTITUTE_VALUES))
+        self.FLOPs_str, self.FLOPs_numeric = _resolve_expr(self.FLOPs)
         #Total element count moved for this op -- inputA + inputB + output,
         #each its own product (not a union: unlike FLOPs, a dim shared between
         #operands still occupies real memory in both, so it's counted twice).
@@ -172,7 +187,9 @@ class MatMul:
         #version below is where a concrete dtype width gets applied, for the
         #roofline model's memory-bound term (bytes_moved / bandwidth).
         self.tensor_size = sympy.prod(self.inputA) + sympy.prod(self.inputB) + sympy.prod(self.output)
-        self.tensor_size_numeric = int(self.tensor_size.subs(SUBSTITUTE_VALUES)) * BYTES_PER_ELEMENT
+        tensor_size_str, tensor_size_numeric = _resolve_expr(self.tensor_size)
+        self.tensor_size_str = tensor_size_str
+        self.tensor_size_numeric = tensor_size_numeric * BYTES_PER_ELEMENT
 
     def __str__(self):
         return f"[{','.join(str(x) for x in self.inputA)}] x [{','.join(str(x) for x in self.inputB)}] -> [{','.join(str(x) for x in self.output)}]"
@@ -986,16 +1003,24 @@ def construct_1f1b_schedule(num_microbatches:int):
             else:
                 raise ValueError(f"Invalid dependency chain: {prev_op} -> {curr_op}")
 
+#Same reasoning as _MATMUL_EXPR_CACHE: individual dims (e.g. "S/cp") recur
+#identically across thousands of matmul instances, so str() on each one is
+#worth memoizing too rather than re-printing the same handful of dims over
+#and over.
+@functools.lru_cache(maxsize=None)
+def _dim_str(dim:sympy.Expr) -> str:
+    return str(dim)
+
 def matmul_to_json(matmul:MatMul) -> Dict:
     return {
         "name": matmul.name,
-        "inputA": [str(dim) for dim in matmul.inputA],
-        "inputB": [str(dim) for dim in matmul.inputB],
-        "contracting_dims": [str(dim) for dim in matmul.contracting_dims],
-        "output": [str(dim) for dim in matmul.output],
-        "FLOPs": str(matmul.FLOPs),
+        "inputA": [_dim_str(dim) for dim in matmul.inputA],
+        "inputB": [_dim_str(dim) for dim in matmul.inputB],
+        "contracting_dims": [_dim_str(dim) for dim in matmul.contracting_dims],
+        "output": [_dim_str(dim) for dim in matmul.output],
+        "FLOPs": matmul.FLOPs_str,
         "FLOPs_numeric": matmul.FLOPs_numeric,
-        "tensor_size": str(matmul.tensor_size),
+        "tensor_size": matmul.tensor_size_str,
         "tensor_size_numeric": matmul.tensor_size_numeric,
     }
 
