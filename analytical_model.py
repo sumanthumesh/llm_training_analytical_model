@@ -85,10 +85,12 @@ def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbos
     done_events[node_id].succeed()
 
 
-def simulate(topo: Topology, graph, verbose: bool = True) -> float:
+def simulate(topo: Topology, graph, peak_perf_tflops: float, local_mem_bw_gbps: float, verbose: bool = True) -> float:
     routing_table = build_routing_table(topo)
     for node_id, node in graph.nodes(data=True):
-        node["hop_candidates"], node["duration"] = precompute_node(node, routing_table)
+        node["hop_candidates"], node["duration"] = precompute_node(
+            node, routing_table, peak_perf_tflops, local_mem_bw_gbps
+        )
 
     env = simpy.Environment()
     link_manager = LinkManager(env, topo)
@@ -105,6 +107,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the analytical model simulation.")
     parser.add_argument("--topology", type=str, required=True, help="Path to the topology edgelist file.")
     parser.add_argument("--trace", type=str, required=True, help="Path to the trace.json file.")
+    parser.add_argument("--peak-perf", type=float, required=True, help="Peak compute performance in TFLOPS, for COMP node roofline timing.")
+    parser.add_argument("--local-mem-bw", type=float, required=True, help="Local memory bandwidth in GB/s, for COMP node roofline timing.")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node issue/complete logging.")
     args = parser.parse_args()
 
@@ -112,7 +116,7 @@ if __name__ == "__main__":
     # draw_topology(physical_topology, "topology.png")
 
     dag = load_trace(args.trace)
-    finish_time = simulate(physical_topology, dag, verbose=not args.quiet)
+    finish_time = simulate(physical_topology, dag, args.peak_perf, args.local_mem_bw, verbose=not args.quiet)
     print(f"\nSimulation finished at t={finish_time:.9f}s")
 
     

@@ -28,7 +28,34 @@ def ring_hops(members: list[str]) -> list[tuple[str, str]]:
     return list(zip(members, members[1:] + members[:1]))
 
 
-def precompute_node(node: dict, routing_table: RoutingTable) -> tuple[HopCandidates, float]:
+def roofline_time(flops: float, tensor_size_bytes: float, peak_perf_tflops: float, local_mem_bw_gbps: float) -> float:
+    """Roofline model: an op takes as long as whichever of the compute-bound
+    or memory-bound time actually dominates -- see astra-sim's Roofline.cc /
+    Workload::issue_comp, which this mirrors (their two-step
+    operational_intensity -> min(bandwidth*intensity, peak_perf) -> FLOPs/perf
+    collapses to this same max() closed form).
+    """
+    peak_perf = peak_perf_tflops * 1e12
+    local_mem_bw = local_mem_bw_gbps * 1e9
+    return max(flops / peak_perf, tensor_size_bytes / local_mem_bw)
+
+
+def compute_time(matmuls: list[dict], peak_perf_tflops: float, local_mem_bw_gbps: float) -> float:
+    """Time for one inner (parallel) list of a COMP node's comps: everything
+    in it runs at once on the same NPU, so their FLOPs and bytes-moved simply
+    add up before applying the roofline model once to the totals.
+    """
+    total_flops = sum(mm["FLOPs_numeric"] for mm in matmuls)
+    total_tensor_size = sum(mm["tensor_size_numeric"] for mm in matmuls)
+    return roofline_time(total_flops, total_tensor_size, peak_perf_tflops, local_mem_bw_gbps)
+
+
+def precompute_node(
+    node: dict,
+    routing_table: RoutingTable,
+    peak_perf_tflops: float,
+    local_mem_bw_gbps: float,
+) -> tuple[HopCandidates, float]:
     """Returns (hop_candidates, duration_sec) for a single trace node.
     hop_candidates is one list of equal-cost PathInfo alternatives per logical
     hop the collective needs; every alternative for a given hop has the same
@@ -38,9 +65,20 @@ def precompute_node(node: dict, routing_table: RoutingTable) -> tuple[HopCandida
     DUMMY nodes (a collective over a degree-1 parallelism dimension, e.g. a CP
     all-gather when cp=1 -- see trace_generator.py's make_comm_node) are both
     structural only -- no hops, no duration.
+
+    COMP nodes have no hops (pure compute, no network) -- comps is a
+    List[List[Matmul]] where the inner list is a parallel group (one
+    compute_time() call, roofline over the group's totals) and the outer list
+    is sequential stages (their times simply sum, to honor the dependency:
+    e.g. for [[X@W_1,X@W_2],[Y@W_oF]], the first two run together, but the
+    third can't start until both of the first two are done).
     """
     if node["type"] in ("SYNC", "DUMMY"):
         return [], 0.0
+
+    if node["type"] == "COMP":
+        duration = sum(compute_time(stage, peak_perf_tflops, local_mem_bw_gbps) for stage in node["comps"])
+        return [], duration
 
     subtype = node["subtype"]
     size_bytes = node["size"]
