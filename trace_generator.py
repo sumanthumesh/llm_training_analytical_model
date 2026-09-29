@@ -64,6 +64,7 @@ class Node:
     comm_group:List
     size:int
     deps:List
+    comps:List = field(default_factory=list)
 
     def __post_init__(self):
         self.id = Node._next_id
@@ -80,6 +81,17 @@ def make_comm_node(subtype:str, name:str, comm_group:List, size, deps:List, degr
     if degree == 1:
         return Node("DUMMY", subtype, name, [], 0, deps)
     return Node("COMM", subtype, name, comm_group, size, deps)
+
+def make_comp_node(subtype:str, name:str, deps:List, comps:List)->Node:
+    return Node(
+        "COMP",
+        subtype,
+        name,
+        [],
+        0,
+        deps,
+        comps
+    )
 
 class CommGroupTracker:
     def __init__(self):
@@ -123,6 +135,34 @@ def per_layer_weight_sizes():
 def per_layer_gradient_sizes():
     #Assuming grdient size is same as weight size
     return per_layer_weight_sizes()
+
+@dataclass
+class MatMul:
+    name:str
+    inputA:List[sympy.Expr]
+    inputB:List[sympy.Expr]
+    contracting_dims:List[sympy.Expr]
+    output:List[sympy.Expr]
+    FLOPs:sympy.Expr = field(init=False)
+    FLOPs_numeric:int = field(init=False)
+
+    def __post_init__(self):
+        #Every contracting dim must actually be shared by both operands -- an
+        #easy typo to make by hand, and one that would silently skew FLOPs.
+        assert set(self.contracting_dims) <= set(self.inputA) & set(self.inputB), \
+            f"{self.name}: contracting_dims {self.contracting_dims} not present in both inputA and inputB"
+        #2 * (product of every dim appearing in either operand): each
+        #contracting dim appears in both inputA and inputB but only once in
+        #their union, so this is exactly 2 * output_size * contracted_size --
+        #one multiply and one add per MAC -- without needing output at all.
+        self.FLOPs = 2 * sympy.prod(set(self.inputA) | set(self.inputB))
+        #Resolved against the current SUBSTITUTE_VALUES -- same as
+        #RESOLVED_SHARDING_FORMULAS, computed once here rather than by every
+        #caller that wants an actual number instead of the symbolic formula.
+        self.FLOPs_numeric = int(self.FLOPs.subs(SUBSTITUTE_VALUES))
+
+    def __str__(self):
+        return f"[{','.join(str(x) for x in self.inputA)}] x [{','.join(str(x) for x in self.inputB)}] -> [{','.join(str(x) for x in self.output)}]"
 
 sharding_formulas = {
     "fwd_cp_all_gather_k" : M*S*H_k/tp*D_h,
@@ -289,6 +329,19 @@ def single_layer_forward_pass(layer_id,microbatch_id):
         [node.id for node in fsdp_all_gather_nodes] if microbatch_id == 0 else [pre_layer_sync_node.id]
     )
 
+    kvq_projections = [[
+        MatMul("X@W_k",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
+        MatMul("X@W_v",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
+        MatMul("X@W_q",[M,S/cp,D],[D,H_q/tp,D_h],[D],[M,S/cp,H_q/tp,D_h])
+    ]]
+
+    comp_kvq_projection_node = make_comp_node(
+        "MATMUL",
+        f"mb{microbatch_id}.layer{layer_id}.fwd.kvq_projections",
+        [post_fsdp_sync_node.id],
+        kvq_projections
+    )
+
     #If we are doing all gather across CP and for a fixed PP, then there will be an equivalent all gather across each TP and DP.
     #So there are a total of DP*TP all gather operations across CP for each layer and microbatch. 
     #We can get the comm groups for each of these all gather operations by permuting the axes
@@ -301,7 +354,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.k",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_k"],
-            [post_fsdp_sync_node.id],
+            [comp_kvq_projection_node.id],
             degree=CP
         )
         all_gather_v = make_comm_node(
@@ -309,7 +362,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.v",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_v"],
-            [post_fsdp_sync_node.id],
+            [comp_kvq_projection_node.id],
             degree=CP
         )
         cp_all_gather_nodes.append(all_gather_k)
@@ -324,6 +377,19 @@ def single_layer_forward_pass(layer_id,microbatch_id):
         [node.id for node in cp_all_gather_nodes]
     )
 
+    comp_attn_score_output_projection = [
+        [MatMul("Q@K",[M,S/cp,H_q/tp,D_h],[M,S,H_k/tp,D_h],[D_h],[M,H_q/tp,S/cp,S])],
+        [MatMul("S@V",[M,H_q/tp,S/cp,S],[M,S,H_k/tp,D_h],[S],[M,S/cp,H_q/tp,D_h])],
+        [MatMul("A@W_oA",[M,S/cp,H_q/tp,D_h],[H_q/tp,D_h,D],[H_q/tp,D_h],[M,S/cp,D])]
+    ]
+
+    comp_attn_score_output_projection_node = make_comp_node(
+        "MATMUL",
+        f"mb{microbatch_id}.layer{layer_id}.fwd.attn_score_output_projection",
+        [cp_all_gather_sync_node.id],
+        comp_attn_score_output_projection
+    )
+
     tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_id,-2)
     tp_all_reduce_attn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
@@ -332,7 +398,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.attn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["fwd_tp_all_reduce_attn"],
-            [cp_all_gather_sync_node.id],
+            [comp_attn_score_output_projection_node.id],
             degree=TP
         )
         tp_all_reduce_attn_nodes.append(all_reduce_attn)
@@ -345,6 +411,20 @@ def single_layer_forward_pass(layer_id,microbatch_id):
         0,
         [node.id for node in tp_all_reduce_attn_nodes]
     )
+
+    comp_ffn = [
+        [
+            MatMul("X@W_1",[M,S/cp,D],[D,D_ff/tp],[D],[M,S/cp,D_ff/tp]),
+            MatMul("X@W_2",[M,S/cp,D],[D,D_ff/tp],[D],[M,S/cp,D_ff/tp]),
+        ],
+        [MatMul("X@W_oF",[M,S/cp,D_ff/tp],[D_ff/tp,D],[D_ff/tp],[M,S/cp,D])]
+    ]
+    comp_ffn_node = make_comp_node(
+        "MATMUL",
+        f"mb{microbatch_id}.layer{layer_id}.fwd.ffn",
+        [tp_all_reduce_attn_sync_node.id],
+        comp_ffn
+    )
     
     tp_all_reduce_ffn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
@@ -353,7 +433,7 @@ def single_layer_forward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.ffn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["fwd_tp_all_reduce_ffn"],
-            [tp_all_reduce_attn_sync_node.id],
+            [comp_ffn_node.id],
             degree=TP
         )
         tp_all_reduce_ffn_nodes.append(all_reduce_ffn)
@@ -380,6 +460,32 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         []
     )
 
+    # dF_o (=dLoss) is the layer's backward input. Stage 1 (dF, dW_oF) both
+    # depend only on dF_o -- parallel. The elementwise dF_1=dF*F_2, dF_2=dF*F_1
+    # (not matmuls, not modeled) gate stage 2: dW_1/dW_2 (weight grads) and the
+    # two dRA_partial terms all depend only on dF_1/dF_2, which are both ready
+    # at the same time -- so all four are parallel too, even though dW_1/dW_2
+    # don't feed anything downstream (they're GradSync outputs) while the
+    # dRA_partial terms do (their sum, also unmodeled, feeds tp_all_reduce.ffn).
+    comp_ffn_backward = [
+        [
+            MatMul("dFo@WoF",[M,S/cp,D],[D_ff/tp,D],[D],[M,S/cp,D_ff/tp]),
+            MatMul("F@dFo",[M,S/cp,D_ff/tp],[M,S/cp,D],[M,S/cp],[D_ff/tp,D]),
+        ],
+        [
+            MatMul("RA@dF1",[M,S/cp,D],[M,S/cp,D_ff/tp],[M,S/cp],[D,D_ff/tp]),
+            MatMul("RA@dF2",[M,S/cp,D],[M,S/cp,D_ff/tp],[M,S/cp],[D,D_ff/tp]),
+            MatMul("dF1@W1",[M,S/cp,D_ff/tp],[D,D_ff/tp],[D_ff/tp],[M,S/cp,D]),
+            MatMul("dF2@W2",[M,S/cp,D_ff/tp],[D,D_ff/tp],[D_ff/tp],[M,S/cp,D]),
+        ]
+    ]
+    comp_ffn_backward_node = make_comp_node(
+        "MATMUL",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.ffn",
+        [pre_layer_sync_node.id],
+        comp_ffn_backward
+    )
+
     tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-2)
     tp_all_reduce_ffn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
@@ -388,7 +494,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.ffn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_ffn"],
-            [pre_layer_sync_node.id],
+            [comp_ffn_backward_node.id],
             degree=TP
         )
         tp_all_reduce_ffn_nodes.append(all_reduce_ffn)
@@ -402,6 +508,33 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         [node.id for node in tp_all_reduce_ffn_nodes]
     )
 
+    # dA_o (=dRA, post tp_all_reduce.ffn + the unmodeled residual add) is this
+    # block's input. Stage 1 (dA, dW_oA) both depend only on dA_o -- parallel.
+    # Stage 2 (dS, dV_hat) both depend only on dA (from stage 1) -- parallel;
+    # dW_oA doesn't feed either, it's a GradSync output. Stage 3 (dQ, dK_hat)
+    # both depend only on dS (from stage 2) -- parallel; dV_hat doesn't feed
+    # either, it heads straight to cp_reduce_scatter.v.
+    comp_attn_backward = [
+        [
+            MatMul("dAo@WoA",[M,S/cp,D],[H_q/tp,D_h,D],[D],[M,S/cp,H_q/tp,D_h]),
+            MatMul("A@dAo",[M,S/cp,H_q/tp,D_h],[M,S/cp,D],[M,S/cp],[H_q/tp,D_h,D]),
+        ],
+        [
+            MatMul("dA@Vhat",[M,S/cp,H_q/tp,D_h],[M,S,H_k/tp,D_h],[D_h],[M,H_q/tp,S/cp,S]),
+            MatMul("S@dA",[M,H_q/tp,S/cp,S],[M,S/cp,H_q/tp,D_h],[S/cp],[M,S,H_k/tp,D_h]),
+        ],
+        [
+            MatMul("dS@Khat",[M,H_q/tp,S/cp,S],[M,S,H_k/tp,D_h],[S],[M,S/cp,H_q/tp,D_h]),
+            MatMul("dS@Q",[M,H_q/tp,S/cp,S],[M,S/cp,H_q/tp,D_h],[S/cp],[M,S,H_k/tp,D_h]),
+        ]
+    ]
+    comp_attn_backward_node = make_comp_node(
+        "MATMUL",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.attn_score_output_projection",
+        [tp_all_reduce_ffn_sync_node.id],
+        comp_attn_backward
+    )
+
     cp_reduce_scatter_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-1)
     cp_reduce_scatter_nodes = []
     for comm_group in cp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_reduce_scatter_comm_groups))]:
@@ -410,7 +543,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.k",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_k"],
-            [tp_all_reduce_ffn_sync_node.id],
+            [comp_attn_backward_node.id],
             degree=CP
         )
         reduce_scatter_v = make_comm_node(
@@ -418,7 +551,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.v",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_v"],
-            [tp_all_reduce_ffn_sync_node.id],
+            [comp_attn_backward_node.id],
             degree=CP
         )
         cp_reduce_scatter_nodes.append(reduce_scatter_k)
@@ -433,6 +566,26 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         [node.id for node in cp_reduce_scatter_nodes]
     )
 
+    # dK, dV (post cp_reduce_scatter) and dQ (transitively ready too, via
+    # comp_attn_backward as an ancestor of cp_reduce_scatter_sync_node) are
+    # all available here, so every matmul below -- the three weight grads and
+    # the three dX_partial terms -- depends only on them plus pre-existing
+    # X/weights. All six are independent of each other -- one parallel group.
+    comp_kvq_backward = [[
+        MatMul("X@dK",[M,S/cp,D],[M,S/cp,H_k/tp,D_h],[M,S/cp],[D,H_k/tp,D_h]),
+        MatMul("X@dV",[M,S/cp,D],[M,S/cp,H_k/tp,D_h],[M,S/cp],[D,H_k/tp,D_h]),
+        MatMul("X@dQ",[M,S/cp,D],[M,S/cp,H_q/tp,D_h],[M,S/cp],[D,H_q/tp,D_h]),
+        MatMul("dK@Wk",[M,S/cp,H_k/tp,D_h],[D,H_k/tp,D_h],[H_k/tp,D_h],[M,S/cp,D]),
+        MatMul("dV@Wv",[M,S/cp,H_k/tp,D_h],[D,H_k/tp,D_h],[H_k/tp,D_h],[M,S/cp,D]),
+        MatMul("dQ@Wq",[M,S/cp,H_q/tp,D_h],[D,H_q/tp,D_h],[H_q/tp,D_h],[M,S/cp,D]),
+    ]]
+    comp_kvq_backward_node = make_comp_node(
+        "MATMUL",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.kvq_projections",
+        [cp_reduce_scatter_sync_node.id],
+        comp_kvq_backward
+    )
+
     #Reuse same comm  groups as before
     tp_all_reduce_attn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
@@ -442,7 +595,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.attn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_attn"],
-            [cp_reduce_scatter_sync_node.id],
+            [comp_kvq_backward_node.id],
             degree=TP
         )
         tp_all_reduce_attn_nodes.append(all_reduce_attn)
@@ -820,6 +973,17 @@ def construct_1f1b_schedule(num_microbatches:int):
             else:
                 raise ValueError(f"Invalid dependency chain: {prev_op} -> {curr_op}")
 
+def matmul_to_json(matmul:MatMul) -> Dict:
+    return {
+        "name": matmul.name,
+        "inputA": [str(dim) for dim in matmul.inputA],
+        "inputB": [str(dim) for dim in matmul.inputB],
+        "contracting_dims": [str(dim) for dim in matmul.contracting_dims],
+        "output": [str(dim) for dim in matmul.output],
+        "FLOPs": str(matmul.FLOPs),
+        "FLOPs_numeric": matmul.FLOPs_numeric,
+    }
+
 def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
     #Ignoring comm group deduplication (CommGroupTracker) for now — comm_group is written
     #as the literal list of involved NPU ids per node, for visual inspection.
@@ -832,6 +996,7 @@ def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
             "comm_group": [int(npu_id) for npu_id in node.comm_group],
             "size": int(node.size),
             "deps": node.deps,
+            "comps": [[matmul_to_json(matmul) for matmul in stage] for stage in node.comps],
         }
         for node in sorted(nodes, key=lambda n: n.id)
     ]
