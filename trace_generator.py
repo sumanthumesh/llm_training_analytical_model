@@ -33,9 +33,9 @@ SUBSTITUTE_VALUES = {
     D_ff: 53248,
     V: 128000,
     dp: 4,
-    pp: 16,
+    pp: 2,
     cp: 1,
-    tp: 8,
+    tp: 4,
     B: 32*4,
     S: 8192,
     M: 16
@@ -61,6 +61,17 @@ class Node:
         self.id = Node._next_id
         Node._all_nodes[self.id] = self
         Node._next_id += 1
+
+def make_comm_node(subtype:str, name:str, comm_group:List, size, deps:List, degree:int) -> Node:
+    """Creates a COMM node for a real collective, or a DUMMY node if the
+    parallelism dimension it's over has degree 1 (e.g. a CP all-gather when
+    cp=1 has no other rank to gather from -- it's a no-op, not a collective).
+    Keeps the original subtype for traceability; comm_group/size are emptied
+    since there's nothing to communicate.
+    """
+    if degree == 1:
+        return Node("DUMMY", subtype, name, [], 0, deps)
+    return Node("COMM", subtype, name, comm_group, size, deps)
 
 class CommGroupTracker:
     def __init__(self):
@@ -127,20 +138,17 @@ def pipeline_stage_from_layer_id(layer_id:int,num_layers:int) -> int:
     layers_per_stage = num_layers // num_pipeline_stages
     return layer_id // layers_per_stage
 
-def node_id_from_axes(d,c=0,p=0,t=0):
+# def node_id_from_axes(d,c=0,p=0,t=0):
+def node_id_from_axes(dims):
     DP=dp.subs(SUBSTITUTE_VALUES)
     PP=pp.subs(SUBSTITUTE_VALUES)
     CP=cp.subs(SUBSTITUTE_VALUES)
     TP=tp.subs(SUBSTITUTE_VALUES)
-    if isinstance(d, int):
-        #All inputs are integers
-        pass
-    elif isinstance(d, list) or isinstance(d, np.ndarray):
-        #All inputs are lists or arrays
-        c = d[1]
-        p = d[2]
-        t = d[3]
-        d = d[0]
+    #All inputs are lists or arrays
+    c = dims[1]
+    p = dims[2]
+    t = dims[3]
+    d = dims[0]
     return d*PP*CP*TP + p*CP*TP + c*TP + t
 
 def axes_from_node_id(node_id:int):
@@ -168,7 +176,7 @@ def get_pp_transfer_comm_groups(from_stage:int,to_stage:int):
             for t in range(TP):
                 comm_group_coords.append([(d,c,from_stage,t),(d,c,to_stage,t)])
     
-    comm_group_node_ids = [[node_id_from_axes(*coord) for coord in group] for group in comm_group_coords]
+    comm_group_node_ids = [[node_id_from_axes(coord) for coord in group] for group in comm_group_coords]
     return comm_group_node_ids
 
 
@@ -237,6 +245,9 @@ def single_layer_forward_pass(layer_id,microbatch_id):
     #FSDP fetch is outside the scope of this function
 
     pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES))
+    DP=dp.subs(SUBSTITUTE_VALUES)
+    CP=cp.subs(SUBSTITUTE_VALUES)
+    TP=tp.subs(SUBSTITUTE_VALUES)
 
     pre_layer_sync_node = Node(
         "SYNC",
@@ -252,13 +263,13 @@ def single_layer_forward_pass(layer_id,microbatch_id):
     if microbatch_id == 0:
         fsdp_all_gather_comm_groups = permute_axes(-2,-1,pipeline_stage_id,-1)
         for comm_group in fsdp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(fsdp_all_gather_comm_groups))]:
-            all_gather = Node(
-                "COMM",
+            all_gather = make_comm_node(
                 "ALL_GATHER",
                 f"mb{microbatch_id}.layer{layer_id}.fwd.fsdp_all_gather",
                 comm_group,
                 sharding_formulas["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES),
-                [pre_layer_sync_node.id]
+                [pre_layer_sync_node.id],
+                degree=DP
             )
             fsdp_all_gather_nodes.append(all_gather)
 
@@ -278,21 +289,21 @@ def single_layer_forward_pass(layer_id,microbatch_id):
     cp_all_gather_nodes = []
     for comm_group in cp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_all_gather_comm_groups))]:
         #All gather K across CP
-        all_gather_k = Node(
-            "COMM",
+        all_gather_k = make_comm_node(
             "ALL_GATHER",
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.k",
             comm_group,
             sharding_formulas["fwd_cp_all_gather_k"].subs(SUBSTITUTE_VALUES),
-            [post_fsdp_sync_node.id]
+            [post_fsdp_sync_node.id],
+            degree=CP
         )
-        all_gather_v = Node(
-            "COMM",
+        all_gather_v = make_comm_node(
             "ALL_GATHER",
             f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.v",
             comm_group,
             sharding_formulas["fwd_cp_all_gather_v"].subs(SUBSTITUTE_VALUES),
-            [post_fsdp_sync_node.id]
+            [post_fsdp_sync_node.id],
+            degree=CP
         )
         cp_all_gather_nodes.append(all_gather_k)
         cp_all_gather_nodes.append(all_gather_v)
@@ -309,13 +320,13 @@ def single_layer_forward_pass(layer_id,microbatch_id):
     tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_id,-2)
     tp_all_reduce_attn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
-        all_reduce_attn = Node(
-            "COMM",
+        all_reduce_attn = make_comm_node(
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.attn",
             comm_group,
             sharding_formulas["fwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES),
-            [cp_all_gather_sync_node.id]
+            [cp_all_gather_sync_node.id],
+            degree=TP
         )
         tp_all_reduce_attn_nodes.append(all_reduce_attn)
 
@@ -330,13 +341,13 @@ def single_layer_forward_pass(layer_id,microbatch_id):
     
     tp_all_reduce_ffn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
-        all_reduce_ffn = Node(
-            "COMM",
+        all_reduce_ffn = make_comm_node(
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.ffn",
             comm_group,
             sharding_formulas["fwd_tp_all_reduce_ffn"].subs(SUBSTITUTE_VALUES),
-            [tp_all_reduce_attn_sync_node.id]
+            [tp_all_reduce_attn_sync_node.id],
+            degree=TP
         )
         tp_all_reduce_ffn_nodes.append(all_reduce_ffn)
 
@@ -353,7 +364,10 @@ def single_layer_forward_pass(layer_id,microbatch_id):
 
 def single_layer_backward_pass(layer_id,microbatch_id):
     #FSDP reduce scatter is outside the scope of this function
-    
+    DP=dp.subs(SUBSTITUTE_VALUES)
+    CP=cp.subs(SUBSTITUTE_VALUES)
+    TP=tp.subs(SUBSTITUTE_VALUES)
+
     pre_layer_sync_node = Node(
         "SYNC",
         "PRE_LAYER",
@@ -366,13 +380,13 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-2)
     tp_all_reduce_ffn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
-        all_reduce_ffn = Node(
-            "COMM",
+        all_reduce_ffn = make_comm_node(
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.ffn",
             comm_group,
             sharding_formulas["bwd_tp_all_reduce_ffn"].subs(SUBSTITUTE_VALUES),
-            [pre_layer_sync_node.id]
+            [pre_layer_sync_node.id],
+            degree=TP
         )
         tp_all_reduce_ffn_nodes.append(all_reduce_ffn)
 
@@ -388,21 +402,21 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     cp_reduce_scatter_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
     cp_reduce_scatter_nodes = []
     for comm_group in cp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_reduce_scatter_comm_groups))]:
-        reduce_scatter_k = Node(
-            "COMM",
+        reduce_scatter_k = make_comm_node(
             "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.k",
             comm_group,
             sharding_formulas["bwd_cp_reduce_scatter_k"].subs(SUBSTITUTE_VALUES),
-            [tp_all_reduce_ffn_sync_node.id]
+            [tp_all_reduce_ffn_sync_node.id],
+            degree=CP
         )
-        reduce_scatter_v = Node(
-            "COMM",
+        reduce_scatter_v = make_comm_node(
             "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.v",
             comm_group,
             sharding_formulas["bwd_cp_reduce_scatter_v"].subs(SUBSTITUTE_VALUES),
-            [tp_all_reduce_ffn_sync_node.id]
+            [tp_all_reduce_ffn_sync_node.id],
+            degree=CP
         )
         cp_reduce_scatter_nodes.append(reduce_scatter_k)
         cp_reduce_scatter_nodes.append(reduce_scatter_v)
@@ -420,13 +434,13 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     tp_all_reduce_attn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
 
-        all_reduce_attn = Node(
-            "COMM",
+        all_reduce_attn = make_comm_node(
             "ALL_REDUCE",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.attn",
             comm_group,
             sharding_formulas["bwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES),
-            [cp_reduce_scatter_sync_node.id]
+            [cp_reduce_scatter_sync_node.id],
+            degree=TP
         )
         tp_all_reduce_attn_nodes.append(all_reduce_attn)
 
@@ -449,13 +463,13 @@ def single_layer_backward_pass(layer_id,microbatch_id):
 
         grad_dp_reduce_scatter_comm_groups = permute_axes(-2,-1,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
         for comm_group in grad_dp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_dp_reduce_scatter_comm_groups))]:
-            grad_reduce_scatter = Node(
-                "COMM",
+            grad_reduce_scatter = make_comm_node(
                 "REDUCE_SCATTER",
                 f"mb{microbatch_id}.layer{layer_id}.bwd.grad_dp_reduce_scatter",
                 comm_group,
                 sharding_formulas["bwd_fsdp_reduce_scatter"].subs(SUBSTITUTE_VALUES),
-                [tp_all_reduce_attn_sync_node.id]
+                [tp_all_reduce_attn_sync_node.id],
+                degree=DP
             )
             grad_dp_reduce_scatter_nodes.append(grad_reduce_scatter)
 
@@ -470,13 +484,13 @@ def single_layer_backward_pass(layer_id,microbatch_id):
 
         grad_cp_all_reduce_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,L.subs(SUBSTITUTE_VALUES)),-1)
         for comm_group in grad_cp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(grad_cp_all_reduce_comm_groups))]:
-            grad_all_reduce = Node(
-                "COMM",
+            grad_all_reduce = make_comm_node(
                 "ALL_REDUCE",
                 f"mb{microbatch_id}.layer{layer_id}.bwd.grad_cp_all_reduce",
                 comm_group,
                 sharding_formulas["bwd_cp_all_reduce"].subs(SUBSTITUTE_VALUES),
-                [grad_dp_reduce_scatter_sync_node.id]
+                [grad_dp_reduce_scatter_sync_node.id],
+                degree=CP
             )
             grad_cp_all_reduce_nodes.append(grad_all_reduce)    
 
