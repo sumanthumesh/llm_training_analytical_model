@@ -32,7 +32,16 @@ import networkx as nx
 
 @dataclass
 class Topology:
-    graph: nx.Graph
+    """graph is a DiGraph with two directed edges (a->b and b->a) per edgelist
+    'link' line, each carrying its own speed_Gbps/latency_ns (identical to each
+    other, since the file only specifies one value per line). This lets
+    LinkManager reserve each direction independently -- some collective
+    implementations drive both directions of a link concurrently, which a
+    single undirected edge can't represent (it would force one direction to
+    wait for the other to release).
+    """
+
+    graph: nx.DiGraph
     num_hosts: int
     num_switches: int
     defaults: dict = field(default_factory=dict)
@@ -83,7 +92,7 @@ class Topology:
 
         if len(paths) > 1:
             def load(path):
-                usages = [self._edge_usage.get(frozenset((u, v)), 0) for u, v in zip(path, path[1:])]
+                usages = [self._edge_usage.get((u, v), 0) for u, v in zip(path, path[1:])]
                 return (max(usages), sum(usages))
 
             best_load = min(load(p) for p in paths)
@@ -96,7 +105,7 @@ class Topology:
             path = paths[0]
 
         for u, v in zip(path, path[1:]):
-            edge = frozenset((u, v))
+            edge = (u, v)
             self._edge_usage[edge] = self._edge_usage.get(edge, 0) + 1
         return path
 
@@ -117,7 +126,7 @@ def _parse_kv_pairs(tokens: list[str]) -> dict:
 
 
 def parse_edgelist(path: str) -> Topology:
-    graph = nx.Graph()
+    graph = nx.DiGraph()
     defaults = {
         "speed_Gbps": None,
         "latency_ns": None,
@@ -168,7 +177,11 @@ def parse_edgelist(path: str) -> Topology:
                     if node not in graph:
                         node_type = "host" if node.startswith("h") else "switch"
                         graph.add_node(node, type=node_type)
+                # Two directed edges, not one undirected edge: each direction
+                # of a physical link is an independently reservable resource
+                # (see Topology's docstring).
                 graph.add_edge(a, b, speed_Gbps=speed_gbps, latency_ns=latency_ns)
+                graph.add_edge(b, a, speed_Gbps=speed_gbps, latency_ns=latency_ns)
             else:
                 raise ValueError(f"Unrecognized edgelist keyword: {keyword!r} in line: {line!r}")
 
@@ -178,7 +191,10 @@ def parse_edgelist(path: str) -> Topology:
 def draw_topology(topo: Topology, output_path: str | None = None, show: bool = False) -> None:
     import matplotlib.pyplot as plt
 
-    graph = topo.graph
+    # topo.graph carries two directed edges (a->b, b->a) per physical link, with
+    # identical attrs on each -- collapse to one undirected edge per link purely
+    # for drawing, so the plot doesn't show every link twice.
+    graph = topo.graph.to_undirected()
     pos = nx.spring_layout(graph, seed=0, k=1.5 / max(1, len(graph.nodes) ** 0.5))
 
     plt.figure(figsize=(max(6, len(topo.hosts) * 0.8), 6))

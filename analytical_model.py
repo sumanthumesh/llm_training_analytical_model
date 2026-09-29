@@ -17,19 +17,24 @@ class LinkManager:
     replaced with a fresh event every time links are released, so waiters
     re-check the full set of links they need rather than racing over
     individually-acquired simpy.Resources (which could deadlock).
+
+    Links are directed (u, v) pairs, one per direction of a physical link (see
+    Topology's docstring) -- so a transfer a->b and a concurrent transfer b->a
+    reserve different resources and can proceed at the same time, matching
+    collective implementations that drive both directions of a link at once.
     """
 
     def __init__(self, env: simpy.Environment, topo: Topology):
         self.env = env
-        self.available = {frozenset(edge) for edge in topo.graph.edges()}
+        self.available = set(topo.graph.edges())
         self._changed = env.event()
 
-    def acquire(self, links: set[frozenset]):
+    def acquire(self, links: set[tuple[str, str]]):
         while not links <= self.available:
             yield self._changed
         self.available -= links
 
-    def release(self, links: set[frozenset]):
+    def release(self, links: set[tuple[str, str]]):
         self.available |= links
         changed, self._changed = self._changed, self.env.event()
         changed.succeed()
@@ -53,9 +58,9 @@ def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbos
     done_events[node_id].succeed()
 
 
-def simulate(topo: Topology, graph, comm_groups, verbose: bool = True) -> float:
+def simulate(topo: Topology, graph, verbose: bool = True) -> float:
     for node_id, node in graph.nodes(data=True):
-        node["links"], node["duration"] = precompute_node(topo, node, comm_groups)
+        node["links"], node["duration"] = precompute_node(topo, node)
 
     env = simpy.Environment()
     link_manager = LinkManager(env, topo)
@@ -76,10 +81,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     physical_topology = parse_edgelist(args.topology)
-    draw_topology(physical_topology, "topology.png")
+    # draw_topology(physical_topology, "topology.png")
 
-    dag, comm_groups = load_trace(args.trace)
-    finish_time = simulate(physical_topology, dag, comm_groups, verbose=not args.quiet)
+    dag = load_trace(args.trace)
+    finish_time = simulate(physical_topology, dag, verbose=not args.quiet)
     print(f"\nSimulation finished at t={finish_time:.9f}s")
 
     

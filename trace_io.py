@@ -1,4 +1,4 @@
-"""Load a trace.json (see trace.json) into a dependency DAG plus its comm groups."""
+"""Load a trace.json (see trace.json) into a dependency DAG."""
 
 from __future__ import annotations
 
@@ -7,10 +7,9 @@ import json
 import networkx as nx
 
 
-def load_trace(path: str) -> tuple[nx.DiGraph, dict[str, list[int]]]:
-    """Returns (dag, comm_groups): dag has one node per trace node (attrs preserved,
-    edges dep -> node), comm_groups maps comm_group id (as a string key, matching the
-    json) to the list of NPU ids in that group.
+def load_trace(path: str) -> nx.DiGraph:
+    """Returns a dag with one node per trace node (attrs preserved, including the
+    literal comm_group NPU-id list), edges dep -> node.
     """
     with open(path) as f:
         data = json.load(f)
@@ -22,5 +21,4 @@ def load_trace(path: str) -> tuple[nx.DiGraph, dict[str, list[int]]]:
         for dep in node.get("deps", []):
             graph.add_edge(dep, node["id"])
 
-    # return graph, data["comm_groups"]
-    return graph, {"comm_groups":[]}
+    return graph
