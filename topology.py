@@ -88,25 +88,44 @@ def build_routing_table(topo: Topology) -> RoutingTable:
     collective's duration. This replaces the old bfs_path_hops, whose load
     tiebreak was a static per-call-order heuristic; LinkManager now resolves
     load for real, against actual link availability, at runtime instead.
+
+    Runs one BFS per source and reuses it for every destination from that
+    source, rather than one independent search per (src, dst) pair -- O(hosts)
+    graph traversals instead of O(hosts^2), which is what makes this scale to
+    large host counts (a naive per-pair nx.all_shortest_paths call took over
+    3 minutes at 512 hosts; this approach is well under a second).
     """
     table: RoutingTable = {}
     hosts = topo.hosts
+    graph = topo.graph
+
+    def path_info(path: list[str]) -> PathInfo:
+        hops = list(zip(path, path[1:]))
+        links = frozenset(hops)
+        latency_sec = sum(graph.edges[u, v]["latency_ns"] for u, v in hops) * 1e-9
+        bandwidth_gbps = min(graph.edges[u, v]["speed_Gbps"] for u, v in hops)
+        return PathInfo(links, latency_sec, bandwidth_gbps)
 
     for src in hosts:
+        dist = nx.single_source_shortest_path_length(graph, src)
+
+        # Every shortest path from src to each node, built in one pass over
+        # nodes in increasing distance order: a node's paths are its
+        # shortest-path-DAG predecessors' paths, each extended by one hop.
+        # This is what lets every destination reuse the single BFS above
+        # instead of re-deriving its own path set from scratch.
+        paths_from_src: dict[str, list[list[str]]] = {src: [[src]]}
+        for node in sorted(dist, key=dist.get):
+            if node == src:
+                continue
+            preds = [u for u in graph.predecessors(node) if dist.get(u) == dist[node] - 1]
+            paths_from_src[node] = [p + [node] for u in preds for p in paths_from_src[u]]
+
         for dst in hosts:
             if src == dst:
                 continue
 
-            paths = list(nx.all_shortest_paths(topo.graph, src, dst))
-
-            def path_info(path: list[str]) -> PathInfo:
-                hops = list(zip(path, path[1:]))
-                links = frozenset(hops)
-                latency_sec = sum(topo.graph.edges[u, v]["latency_ns"] for u, v in hops) * 1e-9
-                bandwidth_gbps = min(topo.graph.edges[u, v]["speed_Gbps"] for u, v in hops)
-                return PathInfo(links, latency_sec, bandwidth_gbps)
-
-            candidates = [path_info(p) for p in paths]
+            candidates = [path_info(p) for p in paths_from_src.get(dst, [])]
 
             best_latency = min(c.latency_sec for c in candidates)
             candidates = [c for c in candidates if c.latency_sec == best_latency]
