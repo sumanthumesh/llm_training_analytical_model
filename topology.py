@@ -24,7 +24,6 @@ host-switch links.
 from __future__ import annotations
 
 import argparse
-import hashlib
 from dataclasses import dataclass, field
 
 import networkx as nx
@@ -45,7 +44,6 @@ class Topology:
     num_hosts: int
     num_switches: int
     defaults: dict = field(default_factory=dict)
-    _edge_usage: dict = field(default_factory=dict, repr=False)
 
     @property
     def hosts(self) -> list[str]:
@@ -55,63 +53,70 @@ class Topology:
     def switches(self) -> list[str]:
         return [n for n, d in self.graph.nodes(data=True) if d["type"] == "switch"]
 
-    def bfs_path_hops(self, src: str, dst: str) -> list[str]:
-        """A shortest path (by hop count) between two nodes, e.g. bfs_path_hops("h0", "h5").
-
-        Narrows ties in three stages:
-        1. Hop count (nx.all_shortest_paths).
-        2. Total latency -- a node with both an NVSwitch and an IB leaf has
-           two hop-count-tied paths of very different cost (see
-           generate_htsim_topology.py's comment on why NVSwitches are
-           numbered before IB leaves), so a pure hop-count tie must not be
-           treated as interchangeable.
-        3. Load: among genuinely equal-cost paths (e.g. one per spine in a
-           fat tree), picks whichever currently reuses the least-loaded
-           edges, so concurrent flows spread across all of them instead of
-           piling onto one -- routing for maximum available parallelism
-           rather than replaying real ECMP hash collisions. Remaining ties
-           (typically only the very first call) fall back to a hash of
-           (src, dst) for a stable pick.
-
-        This makes the method stateful: it tallies how much each edge has
-        been routed over so far (across the whole topology, not scoped to a
-        (src, dst) pair) and updates that tally on every call. Calling it
-        again for the same pair after other routing has happened can
-        therefore return a different path than an earlier call did. This
-        tally is a static load-balancing heuristic over call order, not a
-        model of runtime concurrency -- that's what LinkManager is for.
-        """
-        paths = list(nx.all_shortest_paths(self.graph, src, dst))
-
-        if len(paths) > 1:
-            def total_latency_ns(path):
-                return sum(self.graph.edges[u, v]["latency_ns"] for u, v in zip(path, path[1:]))
-
-            best_latency = min(total_latency_ns(p) for p in paths)
-            paths = [p for p in paths if total_latency_ns(p) == best_latency]
-
-        if len(paths) > 1:
-            def load(path):
-                usages = [self._edge_usage.get((u, v), 0) for u, v in zip(path, path[1:])]
-                return (max(usages), sum(usages))
-
-            best_load = min(load(p) for p in paths)
-            paths = [p for p in paths if load(p) == best_load]
-
-        if len(paths) > 1:
-            digest = hashlib.sha256(f"{src}->{dst}".encode()).digest()
-            path = paths[int.from_bytes(digest, "big") % len(paths)]
-        else:
-            path = paths[0]
-
-        for u, v in zip(path, path[1:]):
-            edge = (u, v)
-            self._edge_usage[edge] = self._edge_usage.get(edge, 0) + 1
-        return path
-
     def bfs_order(self, src: str) -> list[str]:
         """Nodes in BFS order starting from src."""
         return list(nx.bfs_tree(self.graph, src).nodes())
+
+
+@dataclass(frozen=True)
+class PathInfo:
+    """One candidate physical path for a (src, dst) host pair."""
+
+    links: frozenset[tuple[str, str]]
+    latency_sec: float
+    bandwidth_gbps: float
+
+
+RoutingTable = dict[tuple[str, str], list["PathInfo"]]
+
+
+def build_routing_table(topo: Topology) -> RoutingTable:
+    """All-pairs routing table over hosts only (switches are pass-through hops,
+    never a (src, dst) themselves).
+
+    For each (src, dst), keeps every path tied for lexicographically-best
+    (hop count, total latency, bottleneck bandwidth) -- narrowing in that
+    order, so hop count dominates (e.g. it alone already prefers an
+    inner-domain path over an outer-domain one, since the inner path is
+    physically shorter), latency breaks ties within a hop count, and
+    bandwidth breaks remaining ties (e.g. between same-hop-count paths
+    through different spine switches with different link speeds).
+
+    Every PathInfo kept for a given (src, dst) is therefore genuinely
+    interchangeable -- same latency, same bandwidth -- so a caller can use
+    whichever one is actually free at runtime without it changing the
+    collective's duration. This replaces the old bfs_path_hops, whose load
+    tiebreak was a static per-call-order heuristic; LinkManager now resolves
+    load for real, against actual link availability, at runtime instead.
+    """
+    table: RoutingTable = {}
+    hosts = topo.hosts
+
+    for src in hosts:
+        for dst in hosts:
+            if src == dst:
+                continue
+
+            paths = list(nx.all_shortest_paths(topo.graph, src, dst))
+
+            def path_info(path: list[str]) -> PathInfo:
+                hops = list(zip(path, path[1:]))
+                links = frozenset(hops)
+                latency_sec = sum(topo.graph.edges[u, v]["latency_ns"] for u, v in hops) * 1e-9
+                bandwidth_gbps = min(topo.graph.edges[u, v]["speed_Gbps"] for u, v in hops)
+                return PathInfo(links, latency_sec, bandwidth_gbps)
+
+            candidates = [path_info(p) for p in paths]
+
+            best_latency = min(c.latency_sec for c in candidates)
+            candidates = [c for c in candidates if c.latency_sec == best_latency]
+
+            best_bandwidth = max(c.bandwidth_gbps for c in candidates)
+            candidates = [c for c in candidates if c.bandwidth_gbps == best_bandwidth]
+
+            table[src, dst] = candidates
+
+    return table
 
 
 def _parse_kv_pairs(tokens: list[str]) -> dict:

@@ -2,20 +2,22 @@ import argparse
 
 import simpy
 
-from collectives import precompute_node
-from topology import Topology, draw_topology, parse_edgelist
+from collectives import HopCandidates, precompute_node
+from topology import Topology, build_routing_table, draw_topology, parse_edgelist
 from trace_io import load_trace
 
 
 class LinkManager:
-    """All-or-nothing physical link reservation.
+    """All-or-nothing physical link reservation, with the physical path for
+    each logical hop resolved dynamically against what's actually free.
 
-    A collective only issues once every physical link it needs is free, and
-    then holds all of them for its whole duration -- this is what lets two
-    collectives run concurrently as long as they don't share a link, per
-    refined_plan.md. Implemented as a simpy condition variable: `_changed` is
-    replaced with a fresh event every time links are released, so waiters
-    re-check the full set of links they need rather than racing over
+    A collective only issues once it has found, for every logical hop it
+    needs, some equal-cost candidate path whose links are all free -- and then
+    holds the whole resolved set for its duration. This is what lets two
+    collectives run concurrently as long as their resolved links don't
+    overlap, per refined_plan.md. Implemented as a simpy condition variable:
+    `_changed` is replaced with a fresh event every time links are released,
+    so waiters re-check from scratch rather than racing over
     individually-acquired simpy.Resources (which could deadlock).
 
     Links are directed (u, v) pairs, one per direction of a physical link (see
@@ -29,10 +31,35 @@ class LinkManager:
         self.available = set(topo.graph.edges())
         self._changed = env.event()
 
-    def acquire(self, links: set[tuple[str, str]]):
-        while not links <= self.available:
+    def acquire(self, hop_candidates: HopCandidates):
+        """Resolves each hop to one of its candidate paths and reserves the
+        union, atomically, only once every hop has found a free one.
+
+        Walks the hops in order; for each, picks the first candidate whose
+        links don't collide with a link already tentatively claimed by an
+        earlier hop of this SAME attempt (self-collision within one
+        collective -- two of its own hops can legitimately want the same
+        physical link) and are still globally free. If any hop comes up
+        empty, the whole attempt is discarded -- no partial reservation --
+        and retried once links free up elsewhere.
+        """
+        while True:
+            chosen: set[tuple[str, str]] = set()
+            for candidates in hop_candidates:
+                pick = None
+                for path in candidates:
+                    if path.links & chosen:
+                        continue
+                    if path.links <= self.available - chosen:
+                        pick = path
+                        break
+                if pick is None:
+                    break
+                chosen |= pick.links
+            else:
+                self.available -= chosen
+                return chosen
             yield self._changed
-        self.available -= links
 
     def release(self, links: set[tuple[str, str]]):
         self.available |= links
@@ -46,21 +73,22 @@ def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbos
     if deps:
         yield simpy.AllOf(env, [done_events[dep] for dep in deps])
 
-    yield from link_manager.acquire(node["links"])
+    links = yield from link_manager.acquire(node["hop_candidates"])
     if verbose:
         print(f"{env.now:12.9f}  issue    {node_id:>3}  {node['subtype']:<14} {node['name']}")
 
     yield env.timeout(node["duration"])
 
-    link_manager.release(node["links"])
+    link_manager.release(links)
     if verbose:
         print(f"{env.now:12.9f}  complete {node_id:>3}  {node['subtype']:<14} {node['name']}")
     done_events[node_id].succeed()
 
 
 def simulate(topo: Topology, graph, verbose: bool = True) -> float:
+    routing_table = build_routing_table(topo)
     for node_id, node in graph.nodes(data=True):
-        node["links"], node["duration"] = precompute_node(topo, node)
+        node["hop_candidates"], node["duration"] = precompute_node(node, routing_table)
 
     env = simpy.Environment()
     link_manager = LinkManager(env, topo)
