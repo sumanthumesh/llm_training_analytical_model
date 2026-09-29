@@ -9,6 +9,7 @@ in execution order.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -25,13 +26,49 @@ SUBTYPE_COLORS = {
     "ALL_REDUCE": "#93c47d",
     "REDUCE_SCATTER": "#f6b26b",
     "ALL_TO_ALL": "#c27ba0",
-    "SEND": "#ffd966",
-    "RECV": "#e69138",
+    "SEND_RECV": "#ffd966",
     "BARRIER": "#999999",
     "PRE_LAYER": "#f1c232",
     "POST_LAYER": "#f1c232",
+    "PRE_PIPELINE": "#cc4125",
+    "POST_PIPELINE": "#cc4125",
+    "MATMUL": "#8e7cc3",
 }
 DEFAULT_COLOR = "#cccccc"
+#DUMMY nodes (a collective over a degree-1 parallelism dimension, e.g. a CP
+#all-gather when cp=1) reuse the subtype they would've had if real -- e.g.
+#still "ALL_GATHER" -- since that's genuinely what they're standing in for.
+#Coloring by subtype alone would then make a free no-op indistinguishable
+#from a real, costed collective, so DUMMY overrides to this fixed color
+#regardless of subtype.
+DUMMY_COLOR = "#e0e0e0"
+
+
+def node_color(d: dict) -> str:
+    if d.get("type") == "DUMMY":
+        return DUMMY_COLOR
+    return SUBTYPE_COLORS.get(d.get("subtype"), DEFAULT_COLOR)
+
+
+def comps_summary(d: dict) -> str:
+    """One-line summary of a COMP node's matmuls, for the label -- full detail
+    (every matmul's shapes/FLOPs) goes in the comps data field instead, since
+    that's too much to cram into an inline graph label.
+    """
+    comps = d.get("comps") or []
+    matmuls = [mm for stage in comps for mm in stage]
+    if not matmuls:
+        return ""
+    total_flops = sum(mm.get("FLOPs_numeric", 0) for mm in matmuls)
+    return f"{len(comps)} stage(s), {len(matmuls)} matmul(s), FLOPs={total_flops:,}"
+
+
+def node_label(n, d: dict) -> str:
+    label = f"{n}: {d.get('type')}/{d.get('subtype')}\n{d.get('name', '')}"
+    summary = comps_summary(d)
+    if summary:
+        label += f"\n{summary}"
+    return label
 
 
 def layered_layout(graph: nx.DiGraph) -> dict:
@@ -48,8 +85,8 @@ def draw_trace(graph: nx.DiGraph, output_path: str | None = None, show: bool = F
     # we flip y, so later layers read top-to-bottom.
     pos = {n: (x, -y) for n, (x, y) in pos.items()}
 
-    colors = [SUBTYPE_COLORS.get(d.get("subtype"), DEFAULT_COLOR) for _, d in graph.nodes(data=True)]
-    labels = {n: f"{n}: {d.get('subtype')}\n{d.get('name', '')}" for n, d in graph.nodes(data=True)}
+    colors = [node_color(d) for _, d in graph.nodes(data=True)]
+    labels = {n: node_label(n, d) for n, d in graph.nodes(data=True)}
 
     plt.figure(figsize=(max(8, graph.number_of_nodes() * 1.2), 8))
     nx.draw_networkx_nodes(graph, pos, node_color=colors, node_size=1800)
@@ -59,8 +96,12 @@ def draw_trace(graph: nx.DiGraph, output_path: str | None = None, show: bool = F
     legend_handles = [
         plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color, markersize=12, label=subtype)
         for subtype, color in SUBTYPE_COLORS.items()
-        if any(d.get("subtype") == subtype for _, d in graph.nodes(data=True))
+        if any(d.get("subtype") == subtype and d.get("type") != "DUMMY" for _, d in graph.nodes(data=True))
     ]
+    if any(d.get("type") == "DUMMY" for _, d in graph.nodes(data=True)):
+        legend_handles.append(
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=DUMMY_COLOR, markersize=12, label="DUMMY")
+        )
     plt.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.0, 1.0))
     plt.axis("off")
     plt.tight_layout()
@@ -76,8 +117,8 @@ def _dot_source(graph: nx.DiGraph) -> str:
     """Shared by write_trace_to_dot (rendering) and _dot_layout_positions (layout-only)."""
     lines = ["digraph G {", "  rankdir=TB;", "  node [shape=box, style=filled, fontsize=9];"]
     for n, d in graph.nodes(data=True):
-        color = SUBTYPE_COLORS.get(d.get("subtype"), DEFAULT_COLOR)
-        label = f"{n}: {d.get('subtype')}\\n{d.get('name', '')}".replace('"', '\\"')
+        color = node_color(d)
+        label = node_label(n, d).replace('"', '\\"').replace("\n", "\\n")
         lines.append(f'  "{n}" [label="{label}", fillcolor="{color}"];')
     for u, v in graph.edges():
         lines.append(f'  "{u}" -> "{v}";')
@@ -139,15 +180,20 @@ def write_trace_to_graphml(graph: nx.DiGraph, output_path: str) -> None:
         '<key for="node" id="d3" attr.name="comm_group" attr.type="string"/>',
         '<key for="node" id="d4" attr.name="size" attr.type="long"/>',
         '<key for="node" id="d5" attr.name="deps" attr.type="string"/>',
+        '<key for="node" id="d6" attr.name="comps" attr.type="string"/>',
         '<key for="node" id="d_yf" yfiles.type="nodegraphics"/>',
         '<graph edgedefault="directed">',
     ]
 
     for n, d in graph.nodes(data=True):
-        color = SUBTYPE_COLORS.get(d.get("subtype"), DEFAULT_COLOR)
-        label = escape(f"{n}: {d.get('subtype', '')}\n{d.get('name', '')}")
+        color = node_color(d)
+        label = escape(node_label(n, d))
         comm_group = ",".join(str(x) for x in d.get("comm_group", []))
         deps = ",".join(str(x) for x in d.get("deps", []))
+        # Full per-matmul detail (shapes/FLOPs/tensor sizes) for COMP nodes,
+        # readable in yEd's Properties view -- comps_summary above only puts
+        # a one-line digest in the visible label.
+        comps = json.dumps(d.get("comps", []))
         x, y, w, h = positions.get(str(n), (0.0, 0.0, 140.0, 40.0))
 
         parts.append(f'<node id="{n}">')
@@ -157,6 +203,7 @@ def write_trace_to_graphml(graph: nx.DiGraph, output_path: str) -> None:
         parts.append(f'<data key="d3">{escape(comm_group)}</data>')
         parts.append(f'<data key="d4">{d.get("size", 0)}</data>')
         parts.append(f'<data key="d5">{escape(deps)}</data>')
+        parts.append(f'<data key="d6">{escape(comps)}</data>')
         parts.append(
             f'<data key="d_yf"><y:ShapeNode>'
             f'<y:Geometry x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}"/>'
