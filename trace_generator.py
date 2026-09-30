@@ -358,13 +358,21 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
             )
             fsdp_all_gather_nodes.append(all_gather)
 
+    #For mb==0, fsdp_all_gather_nodes alone isn't enough: since the prefetch
+    #change, they depend on the PREVIOUS layer's start (for overlap), not this
+    #layer's own turn -- so without pre_layer_sync_node here too, this layer's
+    #compute would only wait for its weights to arrive, not for the previous
+    #layer (same physical NPU) to actually finish. pre_layer_sync_node already
+    #transitively requires that (see the caller's per-layer chaining), so
+    #adding it back here is what makes this layer's compute wait for both
+    #"weights ready" and "NPU free" instead of just the former.
     post_fsdp_sync_node = Node(
         "SYNC",
         "BARRIER",
         f"mb{microbatch_id}.layer{layer_id}.fwd.post_fsdp_all_gather",
         [],
         0,
-        [node.id for node in fsdp_all_gather_nodes] if microbatch_id == 0 else [pre_layer_sync_node.id]
+        ([node.id for node in fsdp_all_gather_nodes] + [pre_layer_sync_node.id]) if microbatch_id == 0 else [pre_layer_sync_node.id]
     )
 
     kvq_projections = [[
