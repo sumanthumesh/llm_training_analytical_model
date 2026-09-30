@@ -55,6 +55,7 @@ def precompute_node(
     routing_table: RoutingTable,
     peak_perf_tflops: float,
     local_mem_bw_gbps: float,
+    fixed_overhead_sec: float = 0.0,
 ) -> tuple[HopCandidates, float]:
     """Returns (hop_candidates, duration_sec) for a single trace node.
     hop_candidates is one list of equal-cost PathInfo alternatives per logical
@@ -72,6 +73,16 @@ def precompute_node(
     is sequential stages (their times simply sum, to honor the dependency:
     e.g. for [[X@W_1,X@W_2],[Y@W_oF]], the first two run together, but the
     third can't start until both of the first two are done).
+
+    fixed_overhead_sec is a one-time, per-op cost (kernel launch / issue
+    overhead) added once per COMM node regardless of its ring step count --
+    distinct from alpha_beta_time's per-hop latency_sec, which is paid once
+    per ring step. Fit against real_system_reference.csv: at the smallest
+    message size, all_reduce (10 ring steps) was barely slower than
+    all_gather (5 steps) -- 23.57us vs 19.01us, nowhere near 2x -- which rules
+    out a per-step explanation and points to a fixed per-invocation cost
+    instead. It isn't a network resource, so it doesn't touch LinkManager /
+    hop_candidates -- just a flat addition to duration.
     """
     if node["type"] in ("SYNC", "DUMMY"):
         return [], 0.0
@@ -119,4 +130,4 @@ def precompute_node(
     else:
         raise ValueError(f"Unsupported collective subtype: {subtype!r}")
 
-    return hop_candidates, duration
+    return hop_candidates, fixed_overhead_sec + duration

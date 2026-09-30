@@ -178,11 +178,12 @@ def simulate(
     local_mem_bw_gbps: float,
     verbose: bool = True,
     track_overlap: bool = False,
+    fixed_overhead_sec: float = 0.0,
 ) -> float:
     routing_table = build_routing_table(topo)
     for node_id, node in graph.nodes(data=True):
         node["hop_candidates"], node["duration"] = precompute_node(
-            node, routing_table, peak_perf_tflops, local_mem_bw_gbps
+            node, routing_table, peak_perf_tflops, local_mem_bw_gbps, fixed_overhead_sec
         )
 
     env = simpy.Environment()
@@ -202,6 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--trace", type=str, required=True, help="Path to the trace.json file.")
     parser.add_argument("--peak-perf", type=float, required=True, help="Peak compute performance in TFLOPS, for COMP node roofline timing.")
     parser.add_argument("--local-mem-bw", type=float, required=True, help="Local memory bandwidth in GB/s, for COMP node roofline timing.")
+    parser.add_argument("--fixed-overhead-ns", type=float, default=0.0, help="Fixed per-op overhead (kernel launch/issue cost) added once per COMM node, in nanoseconds.")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node issue/complete logging.")
     parser.add_argument("--overlap", action="store_true", help="Track and report exposed-compute/exposed-comm/overlapped/idle time breakdown.")
     parser.add_argument("--perfetto-trace", type=str, default=None, help="Write a Perfetto/Chrome-trace-format JSON to this path (open at ui.perfetto.dev).")
@@ -213,7 +215,13 @@ if __name__ == "__main__":
     dag = load_trace(args.trace)
     track_overlap = args.overlap or args.perfetto_trace is not None
     finish_time = simulate(
-        physical_topology, dag, args.peak_perf, args.local_mem_bw, verbose=not args.quiet, track_overlap=track_overlap
+        physical_topology,
+        dag,
+        args.peak_perf,
+        args.local_mem_bw,
+        verbose=not args.quiet,
+        track_overlap=track_overlap,
+        fixed_overhead_sec=args.fixed_overhead_ns * 1e-9,
     )
     print(f"\nSimulation finished at t={finish_time:.9f}s")
 
