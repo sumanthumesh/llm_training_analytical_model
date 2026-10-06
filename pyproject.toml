@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "analytical-model"
+version = "0.1.0"
+description = "Analytical model for evaluating network topology and parallelism configurations for LLM training."
+requires-python = ">=3.10"
+
+# Package names are independent of their on-disk directory names (mapped via
+# package-dir below) so that `src/trace` -- which would otherwise shadow the
+# stdlib `trace` module if imported as `import trace` -- is importable as
+# `tracegen` instead.
+[tool.setuptools]
+package-dir = { analytical = "src/analytical", network = "src/network", tracegen = "src/trace" }
+packages = ["analytical", "network", "tracegen"]

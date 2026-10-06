@@ -14,7 +14,7 @@ one is actually free can only be known once the simulation is running.
 
 from __future__ import annotations
 
-from topology import PathInfo, RoutingTable
+from analytical.topology import PathInfo, RoutingTable
 
 HopCandidates = list[list[PathInfo]]
 

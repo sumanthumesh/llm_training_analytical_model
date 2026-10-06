@@ -11,7 +11,7 @@ from itertools import product
 import numpy as np
 import enum
 
-import mem_footprint
+from tracegen import mem_footprint
 
 L = sympy.symbols("L")
 H_k = sympy.symbols("H_k")

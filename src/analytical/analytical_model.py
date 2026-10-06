@@ -3,9 +3,9 @@ import json
 
 import simpy
 
-from collectives import HopCandidates, precompute_node
-from topology import Topology, build_routing_table, draw_topology, parse_edgelist
-from trace_io import load_trace
+from analytical.collectives import HopCandidates, precompute_node
+from analytical.topology import Topology, build_routing_table, draw_topology, parse_edgelist
+from analytical.trace_io import load_trace
 
 
 class LinkManager:

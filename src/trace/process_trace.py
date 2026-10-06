@@ -19,7 +19,7 @@ from xml.sax.saxutils import escape
 import matplotlib.pyplot as plt
 import networkx as nx
 
-from trace_io import load_trace
+from analytical.trace_io import load_trace
 
 SUBTYPE_COLORS = {
     "ALL_GATHER": "#6fa8dc",

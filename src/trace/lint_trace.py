@@ -25,7 +25,7 @@ from collections import defaultdict
 
 import networkx as nx
 
-from trace_io import load_trace
+from analytical.trace_io import load_trace
 
 
 def infer_pipeline_stages(graph: nx.DiGraph) -> dict[int, int]:
