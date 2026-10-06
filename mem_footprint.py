@@ -543,6 +543,15 @@ class LayerReprForFoorprint:
           of its own forward or backward transient peak is larger -- checked
           empirically rather than assumed, since the .tex doc's "backward is
           worse" claim isn't ground truth here either.
+
+        total_peak's peak moment occurs exactly when the actively-computing
+        microbatch reaches its own highest-footprint step -- every other
+        contribution (other in-flight microbatches, other already-passed
+        layers on this stage) is a constant background present throughout, so
+        the step achieving active_transient_peak IS where the global peak
+        happens. "peak_step_name" names that step (forward step name, a bwd_*
+        name, or a recompute.*-prefixed name if activation_chkpt spliced a
+        recompute segment in ahead of it); "peak_step_phase" says which half.
         """
         if in_flight is None:
             in_flight = pp_degree
@@ -553,10 +562,14 @@ class LayerReprForFoorprint:
         def footprint_size(footprint):
             return int(sum((t.size for t in footprint), sympy.Integer(0)).subs(SUBSTITUTE_VALUES))
 
+        sized_steps = [(s.name, footprint_size(s.footprint)) for s in steps]
         persistent_per_layer = footprint_size(steps[fwd_len - 1].footprint)
-        fwd_peak_per_layer = max(footprint_size(s.footprint) for s in steps[:fwd_len])
-        bwd_peak_per_layer = max(footprint_size(s.footprint) for s in steps[fwd_len:])
-        active_transient_peak = fwd_peak_per_layer if fwd_peak_per_layer >= bwd_peak_per_layer else bwd_peak_per_layer
+        fwd_peak_name, fwd_peak_per_layer = max(sized_steps[:fwd_len], key=lambda ns: ns[1])
+        bwd_peak_name, bwd_peak_per_layer = max(sized_steps[fwd_len:], key=lambda ns: ns[1])
+        if fwd_peak_per_layer >= bwd_peak_per_layer:
+            active_transient_peak, peak_step_name, peak_step_phase = fwd_peak_per_layer, fwd_peak_name, "forward"
+        else:
+            active_transient_peak, peak_step_name, peak_step_phase = bwd_peak_per_layer, bwd_peak_name, "backward"
 
         active_microbatch_peak = (layers_per_stage - 1) * persistent_per_layer + active_transient_peak
         other_in_flight_contribution = (in_flight - 1) * layers_per_stage * persistent_per_layer
@@ -568,4 +581,6 @@ class LayerReprForFoorprint:
             "active_microbatch_peak": active_microbatch_peak,
             "other_in_flight_contribution": other_in_flight_contribution,
             "total_peak": other_in_flight_contribution + active_microbatch_peak,
+            "peak_step_name": peak_step_name,
+            "peak_step_phase": peak_step_phase,
         }
