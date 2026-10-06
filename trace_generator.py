@@ -10,6 +10,8 @@ from itertools import product
 import numpy as np
 import enum
 
+import mem_footprint
+
 L = sympy.symbols("L")
 H_k = sympy.symbols("H_k")
 H_q = sympy.symbols("H_q")
@@ -1066,6 +1068,45 @@ def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
     with open(filepath, "w") as f:
         json.dump(json_obj, f, indent=2)
 
+def report_memory_footprint() -> None:
+    """Computes and prints the peak per-rank memory footprint (worst-case
+    pipeline stage -- stage 0, see mem_footprint.peak_rank_memory's
+    docstring) using mem_footprint.py's standalone liveness model, plus which
+    single step within a layer's forward/backward it's likely to occur in.
+
+    reuse_fwd_weights=True: this generator's own fsdp_all_gather is only
+    emitted for microbatch 0 (single_layer_forward_pass) -- every later
+    microbatch on a stage is assumed to reuse that same fetch rather than
+    re-gathering, so the footprint model needs the same assumption to stay
+    consistent with what the generated trace actually does.
+
+    activation_chkpt=True: this generator has no notion of recompute at all
+    -- backward's MatMuls (comp_ffn_backward, comp_attn_backward, ...)
+    consume forward tensors directly by shape, with no second occurrence of
+    the forward MatMuls anywhere to regenerate them. There's nothing in the
+    trace itself to read an answer off of, so this is a direct assumption
+    about the real training config being modeled (a model this size would
+    essentially always checkpoint), not something inferred from the nodes.
+    """
+    mem_footprint.SUBSTITUTE_VALUES.clear()
+    mem_footprint.SUBSTITUTE_VALUES.update(SUBSTITUTE_VALUES)
+
+    layer_repr = mem_footprint.LayerReprForFoorprint(activation_chkpt=True, reuse_fwd_weights=True)
+    result = layer_repr.peak_rank_memory(pp_degree=PP, layers_per_stage=NUM_LAYERS // PP)
+
+    bytes_peak = result["total_peak"] * BYTES_PER_ELEMENT
+    print()
+    print("=== Peak memory footprint (worst-case rank, pipeline stage 0) ===")
+    print(f"  assumptions: reuse_fwd_weights=True, activation_chkpt=True, {BYTES_PER_ELEMENT} bytes/element")
+    print(f"  total_peak: {result['total_peak']:,} elements = {bytes_peak / 1e9:.2f} GB")
+    print(f"  likely step: '{result['peak_step_name']}' ({result['peak_step_phase']} pass)")
+    print(f"  breakdown: persistent_per_layer={result['persistent_per_layer']:,}  "
+          f"fwd_peak_per_layer={result['fwd_peak_per_layer']:,}  "
+          f"bwd_peak_per_layer={result['bwd_peak_per_layer']:,}")
+    print(f"             active_microbatch_peak={result['active_microbatch_peak']:,}  "
+          f"other_in_flight_contribution={result['other_in_flight_contribution']:,}")
+
+
 #Divisibility checks for model and training config
 def check_divisibility():
     DP=dp.subs(SUBSTITUTE_VALUES)
@@ -1088,6 +1129,9 @@ def check_divisibility():
     assert D_ff.subs(SUBSTITUTE_VALUES) % TP == 0, f"Feedforward dimension {D_ff.subs(SUBSTITUTE_VALUES)} is not divisible by tensor parallelism {TP}"
     #S should be divisible by CP
     assert S.subs(SUBSTITUTE_VALUES) % CP == 0, f"Sequence length {S.subs(SUBSTITUTE_VALUES)} is not divisible by sequence parallelism {CP}"
+
+
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate a analytical model compatible DAG from model and training config")
@@ -1163,6 +1207,8 @@ if __name__ == '__main__':
     construct_1f1b_schedule(NUM_MICROBATCHES)
 
     write_trace_to_json(list(Node._all_nodes.values()), args.output)
+
+    report_memory_footprint()
 
     print((per_layer_weight_sizes()*tp*(L-2)+2*V*D).subs(SUBSTITUTE_VALUES))
     # per_layer_hand_caclulated = 2*D*H_k*D_h+D*H_q*D_h+D*D+3*D*D_ff
