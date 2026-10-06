@@ -10,6 +10,9 @@ your trace's tensor-parallel degree) should map to a single NVLink domain.
 from __future__ import annotations
 
 import argparse
+import os
+
+from network.visualize import visualize_edgelist_file
 
 
 def generate_dgx_edgelist(
@@ -136,6 +139,7 @@ def main():
     parser.add_argument("--outer-switch-latency-ns", type=float, default=0, help="Processing latency of the spine switch (default: 0).")
     parser.add_argument("--type","-t",choices=["dgx","glass"],required=True,help="Type of topology to generate: 'dgx' for DGX-style NVLink domains, 'glass' for proposed optical fabric.")
     parser.add_argument("-o", "--output", type=str, default="topology.edgelist", help="Output edgelist path.")
+    parser.add_argument("-v", "--visualize", action="store_true", help="Also render an .svg visualization next to --output (same path, .svg extension).")
     args = parser.parse_args()
 
     if args.type == "dgx":
@@ -170,6 +174,10 @@ def main():
 
     num_hosts = args.npus_per_domain * args.num_domains
     print(f"Wrote {args.output}: {num_hosts} hosts across {args.num_domains} domain(s) of {args.npus_per_domain} NPUs each")
+
+    if args.visualize:
+        svg_path = os.path.splitext(args.output)[0] + ".svg"
+        visualize_edgelist_file(args.output, output_path=svg_path)
 
 
 if __name__ == "__main__":
