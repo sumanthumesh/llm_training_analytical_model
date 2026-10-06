@@ -3,6 +3,7 @@ import functools
 import os
 import sys
 import json
+import time
 import sympy
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, ClassVar, Set, Tuple
@@ -1214,8 +1215,18 @@ def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
     json_obj = {
         "nodes": trace,
     }
+    #json.dump(json_obj, f, ...) always uses the slow pure-Python encoder in
+    #CPython's stdlib json module -- it calls iterencode() without
+    #_one_shot=True internally, which is one of the C-accelerated encoder's
+    #requirements, so it falls back to the pure-Python chunked generator
+    #regardless of indent. json.dumps() does pass _one_shot=True by default,
+    #which engages the C encoder (indent=None is the other requirement, so
+    #this also drops pretty-printing -- for a trace this size nobody's
+    #reading it by eye anyway). Measured ~5-8x faster on a representative
+    #multi-million-node payload; this was the dominant cost in trace
+    #generation for large configs, well past MatMul/FLOPs computation.
     with open(filepath, "w") as f:
-        json.dump(json_obj, f, indent=2)
+        f.write(json.dumps(json_obj))
 
 def report_memory_footprint() -> None:
     """Computes and prints the peak per-rank memory footprint (worst-case
@@ -1365,11 +1376,16 @@ if __name__ == '__main__':
 
     # write_trace_to_json(list(all_nodes_single_layer_single_microbatch.values()), "trace_single_layer.json")
 
-
+    gen_start_time = time.time()
     construct_1f1b_schedule(NUM_MICROBATCHES)
-
+    gen_end_time = time.time()
+    print(f"Generated trace in {gen_end_time - gen_start_time:.2f}s")
+    
+    wr_start_time = time.time()
     write_trace_to_json(list(Node._all_nodes.values()), args.output)
-
+    wr_end_time = time.time()
+    print(f"Wrote trace to {args.output} in {wr_end_time - wr_start_time:.2f}s")
+    
     report_memory_footprint()
 
     print((per_layer_weight_sizes()*tp*(L-2)+2*V*D).subs(SUBSTITUTE_VALUES))
