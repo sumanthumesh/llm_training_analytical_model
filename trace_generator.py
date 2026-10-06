@@ -56,6 +56,15 @@ MAX_COMM_GROUPS_PER_COMM = 1
 #Bytes per element for MatMul.tensor_size_numeric -- 2 (bf16/fp16) is the
 #de facto default training precision; overridden from --bytes-per-element.
 BYTES_PER_ELEMENT = 2
+#Whether backward can assume forward's fsdp_all_gather left weights resident
+#-- overridden from --reuse-fwd-fsdp; False (the flag's own default) means
+#backward re-fetches them itself on its first microbatch on each stage.
+REUSE_FWD_FSDP = False
+#Whether activations are checkpointed (dropped after forward, regenerated
+#via single_layer_recompute right before backward needs them) rather than
+#kept resident the whole fwd/bwd gap -- overridden from --activation-chkpt;
+#False (the flag's own default) means recompute nodes get added.
+ACTIVATION_CHKPT = False
 
 @dataclass
 class Node:
@@ -497,8 +506,111 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
 
     return [pre_layer_sync_node,post_layer_sync_node]
 
+def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, dep_id):
+    """Regenerates ONE of the two groups of forward tensors activation
+    checkpointing dropped, as a fresh second occurrence of just the forward
+    ops that produce it -- not a full copy of forward's compute, since
+    backward doesn't need everything forward produced:
+
+    segment="ffn": regenerates F1/F2 (comp_ffn's X@W_1, X@W_2 matmuls) --
+    what comp_ffn_backward reads. Excludes the down-projection (X@W_oF ->
+    F_o); comp_ffn_backward never reads F_o.
+
+    segment="attn": regenerates K/V/Q/K_hat/V_hat/S/A (kvq_projection, a
+    REAL cp_all_gather -- regenerating K_hat/V_hat means re-doing the actual
+    CP network transfer, not just local compute -- and the score/attn
+    matmuls) -- what comp_attn_backward reads. Excludes the output
+    projection (A@W_oA -> A_o); comp_attn_backward never reads A_o.
+
+    dep_id is the single dependency this segment chains onto. The caller is
+    responsible for making it whatever this layer's backward has reached by
+    the point this segment's own first consumer needs it (ffn: right after
+    this layer's backward starts; attn: after the ffn-backward chain,
+    matching comp_attn_backward's own current entry point) -- this segment
+    runs on the same physical NPU as the rest of this layer's backward, so
+    it must be ordered into that SAME single-NPU sequential chain rather
+    than independently rooted in a way the simulator could treat as
+    runnable concurrently with the rest of backward.
+
+    Returns the last node's id, for the caller to point its real backward
+    matmul's dep at instead of depending on dep_id directly.
+    """
+    if segment == "ffn":
+        recompute_ffn = [[
+            MatMul("X@W_1",[M,S/cp,D],[D,D_ff/tp],[D],[M,S/cp,D_ff/tp]),
+            MatMul("X@W_2",[M,S/cp,D],[D,D_ff/tp],[D],[M,S/cp,D_ff/tp]),
+        ]]
+        recompute_ffn_node = make_comp_node(
+            "MATMUL",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_ffn",
+            [dep_id],
+            recompute_ffn
+        )
+        return recompute_ffn_node.id
+
+    elif segment == "attn":
+        recompute_kvq = [[
+            MatMul("X@W_k",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
+            MatMul("X@W_v",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
+            MatMul("X@W_q",[M,S/cp,D],[D,H_q/tp,D_h],[D],[M,S/cp,H_q/tp,D_h])
+        ]]
+        recompute_kvq_node = make_comp_node(
+            "MATMUL",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_kvq_projection",
+            [dep_id],
+            recompute_kvq
+        )
+
+        cp_all_gather_comm_groups = permute_axes(-1,-2,pipeline_stage_id,-1)
+        recompute_cp_all_gather_nodes = []
+        for comm_group in cp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_all_gather_comm_groups))]:
+            all_gather_k = make_comm_node(
+                "ALL_GATHER",
+                f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_cp_all_gather.k",
+                comm_group,
+                RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_k"],
+                [recompute_kvq_node.id],
+                degree=CP
+            )
+            all_gather_v = make_comm_node(
+                "ALL_GATHER",
+                f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_cp_all_gather.v",
+                comm_group,
+                RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_v"],
+                [recompute_kvq_node.id],
+                degree=CP
+            )
+            recompute_cp_all_gather_nodes.append(all_gather_k)
+            recompute_cp_all_gather_nodes.append(all_gather_v)
+
+        recompute_cp_all_gather_sync_node = Node(
+            "SYNC",
+            "BARRIER",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_post_cp_all_gather",
+            [],
+            0,
+            [node.id for node in recompute_cp_all_gather_nodes]
+        )
+
+        recompute_score_attn = [
+            [MatMul("Q@K",[M,S/cp,H_q/tp,D_h],[M,S,H_k/tp,D_h],[D_h],[M,H_q/tp,S/cp,S])],
+            [MatMul("S@V",[M,H_q/tp,S/cp,S],[M,S,H_k/tp,D_h],[S],[M,S/cp,H_q/tp,D_h])],
+        ]
+        recompute_attn_node = make_comp_node(
+            "MATMUL",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_attn_score",
+            [recompute_cp_all_gather_sync_node.id],
+            recompute_score_attn
+        )
+        return recompute_attn_node.id
+
+    else:
+        raise ValueError(f"Unknown recompute segment: {segment!r}")
+
 def single_layer_backward_pass(layer_id,microbatch_id):
     #FSDP reduce scatter is outside the scope of this function
+    pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,NUM_LAYERS)
+
     pre_layer_sync_node = Node(
         "SYNC",
         "PRE_LAYER",
@@ -506,6 +618,35 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         [],
         0,
         []
+    )
+
+    #If weights aren't assumed to still be resident from the forward pass
+    #(REUSE_FWD_FSDP=False), the first microbatch to reach backward on this
+    #stage needs to re-fetch them before any backward matmul can run -- same
+    #mb_id==0 gate as forward's own fetch, since 1F1B preserves microbatch
+    #ordering: mb 0 is always the first to reach both forward AND backward on
+    #any given stage (see get_pp_1f1b_schedule).
+    bwd_fsdp_all_gather_nodes = []
+    if not REUSE_FWD_FSDP and microbatch_id == 0:
+        bwd_fsdp_all_gather_comm_groups = permute_axes(-2,-1,pipeline_stage_id,-1)
+        for comm_group in bwd_fsdp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(bwd_fsdp_all_gather_comm_groups))]:
+            all_gather = make_comm_node(
+                "ALL_GATHER",
+                f"mb{microbatch_id}.layer{layer_id}.bwd.fsdp_all_gather",
+                comm_group,
+                RESOLVED_SHARDING_FORMULAS["fwd_fsdp_all_gather"],
+                [pre_layer_sync_node.id],
+                degree=DP
+            )
+            bwd_fsdp_all_gather_nodes.append(all_gather)
+
+    post_fsdp_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.post_fsdp_all_gather",
+        [],
+        0,
+        ([node.id for node in bwd_fsdp_all_gather_nodes] + [pre_layer_sync_node.id]) if bwd_fsdp_all_gather_nodes else [pre_layer_sync_node.id]
     )
 
     # dF_o (=dLoss) is the layer's backward input. Stage 1 (dF, dW_oF) both
@@ -527,10 +668,14 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             MatMul("dF2@W2",[M,S/cp,D_ff/tp],[D,D_ff/tp],[D_ff/tp],[M,S/cp,D]),
         ]
     ]
+    ffn_backward_dep_id = post_fsdp_sync_node.id
+    if not ACTIVATION_CHKPT:
+        ffn_backward_dep_id = single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, "ffn", post_fsdp_sync_node.id)
+
     comp_ffn_backward_node = make_comp_node(
         "MATMUL",
         f"mb{microbatch_id}.layer{layer_id}.bwd.ffn",
-        [pre_layer_sync_node.id],
+        [ffn_backward_dep_id],
         comp_ffn_backward
     )
 
@@ -576,10 +721,14 @@ def single_layer_backward_pass(layer_id,microbatch_id):
             MatMul("dS@Q",[M,H_q/tp,S/cp,S],[M,S/cp,H_q/tp,D_h],[S/cp],[M,S,H_k/tp,D_h]),
         ]
     ]
+    attn_backward_dep_id = tp_all_reduce_ffn_sync_node.id
+    if not ACTIVATION_CHKPT:
+        attn_backward_dep_id = single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, "attn", tp_all_reduce_ffn_sync_node.id)
+
     comp_attn_backward_node = make_comp_node(
         "MATMUL",
         f"mb{microbatch_id}.layer{layer_id}.bwd.attn_score_output_projection",
-        [tp_all_reduce_ffn_sync_node.id],
+        [attn_backward_dep_id],
         comp_attn_backward
     )
 
@@ -1074,30 +1223,25 @@ def report_memory_footprint() -> None:
     docstring) using mem_footprint.py's standalone liveness model, plus which
     single step within a layer's forward/backward it's likely to occur in.
 
-    reuse_fwd_weights=True: this generator's own fsdp_all_gather is only
-    emitted for microbatch 0 (single_layer_forward_pass) -- every later
-    microbatch on a stage is assumed to reuse that same fetch rather than
-    re-gathering, so the footprint model needs the same assumption to stay
-    consistent with what the generated trace actually does.
-
-    activation_chkpt=True: this generator has no notion of recompute at all
-    -- backward's MatMuls (comp_ffn_backward, comp_attn_backward, ...)
-    consume forward tensors directly by shape, with no second occurrence of
-    the forward MatMuls anywhere to regenerate them. There's nothing in the
-    trace itself to read an answer off of, so this is a direct assumption
-    about the real training config being modeled (a model this size would
-    essentially always checkpoint), not something inferred from the nodes.
+    reuse_fwd_weights=REUSE_FWD_FSDP, activation_chkpt=ACTIVATION_CHKPT: both
+    mirror whatever --reuse-fwd-fsdp / --activation-chkpt were actually set
+    to for this run (both default false, i.e. re-fetch/recompute). The
+    generated trace's own backward pass makes exactly these same two
+    assumptions (see single_layer_backward_pass / single_layer_recompute),
+    so the footprint model needs to match them rather than use fixed values
+    -- otherwise this report would silently stop matching the trace as soon
+    as either flag changes.
     """
     mem_footprint.SUBSTITUTE_VALUES.clear()
     mem_footprint.SUBSTITUTE_VALUES.update(SUBSTITUTE_VALUES)
 
-    layer_repr = mem_footprint.LayerReprForFoorprint(activation_chkpt=True, reuse_fwd_weights=True)
+    layer_repr = mem_footprint.LayerReprForFoorprint(activation_chkpt=ACTIVATION_CHKPT, reuse_fwd_weights=REUSE_FWD_FSDP)
     result = layer_repr.peak_rank_memory(pp_degree=PP, layers_per_stage=NUM_LAYERS // PP)
 
     bytes_peak = result["total_peak"] * BYTES_PER_ELEMENT
     print()
     print("=== Peak memory footprint (worst-case rank, pipeline stage 0) ===")
-    print(f"  assumptions: reuse_fwd_weights=True, activation_chkpt=True, {BYTES_PER_ELEMENT} bytes/element")
+    print(f"  assumptions: reuse_fwd_weights={REUSE_FWD_FSDP}, activation_chkpt={ACTIVATION_CHKPT}, {BYTES_PER_ELEMENT} bytes/element")
     print(f"  total_peak: {result['total_peak']:,} elements = {bytes_peak / 1e9:.2f} GB")
     print(f"  likely step: '{result['peak_step_name']}' ({result['peak_step_phase']} pass)")
     print(f"  breakdown: persistent_per_layer={result['persistent_per_layer']:,}  "
@@ -1151,6 +1295,22 @@ if __name__ == '__main__':
     parser.add_argument("--tp",type=int,default=8,help="Tensor parallelism degree")
     parser.add_argument("--output","-o",type=str,default="trace.json",help="Output file path for the generated trace JSON")
     parser.add_argument("--bytes-per-element",type=int,default=2,help="Bytes per element for MatMul tensor sizes (default: 2, bf16/fp16)")
+    parser.add_argument(
+        "--reuse-fwd-fsdp",
+        action="store_true",
+        help="Assume the FSDP-gathered weights from the forward pass are still resident when backward "
+             "runs. Default: false -- backward's first microbatch on each stage re-fetches them via an "
+             "extra fsdp_all_gather. Pass --reuse-fwd-fsdp to assume they're still resident instead "
+             "(the original fsdp_all_gather-on-mb0-forward-only pattern, no extra backward gather)."
+    )
+    parser.add_argument(
+        "--activation-chkpt",
+        action="store_true",
+        help="Assume activations are checkpointed (dropped after forward, never recomputed). Default: "
+             "false -- backward regenerates F1/F2 and K/V/Q/K_hat/V_hat/S/A via extra recompute nodes "
+             "(single_layer_recompute) right before it needs them. Pass --activation-chkpt to assume "
+             "they're already resident instead, with no recompute nodes."
+    )
 
     #I'm fixing the ordering for sharding axes based on how deep inside the model they are located
     #dp replicates entire model
@@ -1182,6 +1342,8 @@ if __name__ == '__main__':
         MAX_COMM_GROUPS_PER_COMM = 1000000
 
     BYTES_PER_ELEMENT = args.bytes_per_element
+    REUSE_FWD_FSDP = args.reuse_fwd_fsdp
+    ACTIVATION_CHKPT = args.activation_chkpt
 
     sharding_axes_symbols = [dp,cp,pp,tp]
     sharding_axes = [s.subs(SUBSTITUTE_VALUES) for s in sharding_axes_symbols]
