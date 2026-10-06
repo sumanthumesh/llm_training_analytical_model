@@ -197,6 +197,10 @@ def parse_edgelist(path: str) -> Topology:
                 overrides = _parse_kv_pairs(tokens[3:])
                 speed_gbps = overrides.get("speed_Gbps", defaults["speed_Gbps"])
                 latency_ns = overrides.get("latency_ns", defaults["latency_ns"])
+                # Anything beyond speed_Gbps/latency_ns (e.g. gen_opt_topology.py's
+                # axis_id tag) is still a real per-link attribute -- pass it
+                # through to the edge instead of silently dropping it.
+                extra = {k: v for k, v in overrides.items() if k not in ("speed_Gbps", "latency_ns")}
                 for node in (a, b):
                     if node not in graph:
                         node_type = "host" if node.startswith("h") else "switch"
@@ -204,8 +208,8 @@ def parse_edgelist(path: str) -> Topology:
                 # Two directed edges, not one undirected edge: each direction
                 # of a physical link is an independently reservable resource
                 # (see Topology's docstring).
-                graph.add_edge(a, b, speed_Gbps=speed_gbps, latency_ns=latency_ns)
-                graph.add_edge(b, a, speed_Gbps=speed_gbps, latency_ns=latency_ns)
+                graph.add_edge(a, b, speed_Gbps=speed_gbps, latency_ns=latency_ns, **extra)
+                graph.add_edge(b, a, speed_Gbps=speed_gbps, latency_ns=latency_ns, **extra)
             else:
                 raise ValueError(f"Unrecognized edgelist keyword: {keyword!r} in line: {line!r}")
 

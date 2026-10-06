@@ -10,7 +10,10 @@ your trace's tensor-parallel degree) should map to a single NVLink domain.
 from __future__ import annotations
 
 import argparse
+import os
 from typing import List
+
+from network.visualize import visualize_edgelist_file
 
 
 def generate_dgx_edgelist(
@@ -114,8 +117,14 @@ def generate_opt_edgelist(
     # 1 has no "next" interposer to connect to, so it's skipped entirely (its
     # slice of outer_bandwidth_gbps simply goes unused, same as a degree-1
     # collective becoming a no-op DUMMY node in trace_generator.py).
-    ring_axes = [("pp", pp, pp_ratio), ("cp", cp, cp_ratio), ("dp", dp, dp_ratio)]
-    active_ring_axes = [(name, size, ratio) for name, size, ratio in ring_axes if size > 1]
+    # axis_id is a fixed code (0=pp, 1=cp, 2=dp) tagged onto each ring link
+    # below, independent of ratio/bandwidth -- visualize.py uses it to tell
+    # the rings apart. Grouping by speed_Gbps alone breaks whenever two axes
+    # end up with equal bandwidth, which happens for any equal ring ratio
+    # (e.g. the default [1/3, 1/3, 1/3], or ratios that just happen to be
+    # equal like [3, 3, 3] normalized).
+    ring_axes = [("pp", pp, pp_ratio, 0), ("cp", cp, cp_ratio, 1), ("dp", dp, dp_ratio, 2)]
+    active_ring_axes = [(name, size, ratio, axis_id) for name, size, ratio, axis_id in ring_axes if size > 1]
     num_ring_links = num_domains * len(active_ring_axes)
     num_links = num_hosts + num_ring_links
 
@@ -154,7 +163,7 @@ def generate_opt_edgelist(
     # needing an explicit "previous" link too.
     for domain in range(num_domains):
         d, p, c = domain_coords(domain)
-        for name, size, ratio in active_ring_axes:
+        for name, size, ratio, axis_id in active_ring_axes:
             if name == "pp":
                 next_domain = domain_id(d, (p + 1) % size, c)
             elif name == "cp":
@@ -163,7 +172,7 @@ def generate_opt_edgelist(
                 next_domain = domain_id((d + 1) % size, p, c)
             ring_bandwidth_gbps = outer_bandwidth_gbps * ratio
             lines.append(
-                f"link s{domain} s{next_domain} speed_Gbps {ring_bandwidth_gbps} latency_ns {outer_latency_ns}"
+                f"link s{domain} s{next_domain} speed_Gbps {ring_bandwidth_gbps} latency_ns {outer_latency_ns} axis_id {axis_id}"
             )
 
     return "\n".join(lines) + "\n"
@@ -185,7 +194,10 @@ def main():
     parser.add_argument("--queue-bytes", type=int, default=65536, help="Default queue size in bytes (default: 65536).")
     parser.add_argument("--ring-ratios", type=float, nargs=3, default=[1/3, 1/3, 1/3], metavar=("PP_RATIO", "CP_RATIO", "DP_RATIO"), help="Ratios of outer bandwidth to allocate to the PP, CP, DP rings. Must sum to 1.0.")
     parser.add_argument("-o", "--output", type=str, default="topology.edgelist", help="Output edgelist path.")
+    parser.add_argument("-v", "--visualize", action="store_true", help="Also render an .svg visualization next to --output (same path, .svg extension).")
     args = parser.parse_args()
+
+    normalized_ratios = [r / sum(args.ring_ratios) for r in args.ring_ratios]
 
     edgelist = generate_opt_edgelist(
         args.npus_per_domain,
@@ -196,7 +208,7 @@ def main():
         args.inner_latency_ns,
         args.outer_bandwidth_gbps,
         args.outer_latency_ns,
-        args.ring_ratios,
+        normalized_ratios,
         args.queue_bytes,
         args.switch_latency_ns,
     )
@@ -206,6 +218,10 @@ def main():
     num_domains = args.dp * args.pp * args.cp
     num_hosts = args.npus_per_domain * num_domains
     print(f"Wrote {args.output}: {num_hosts} hosts across {num_domains} interposer(s) (dp={args.dp}, pp={args.pp}, cp={args.cp}) of {args.npus_per_domain} NPUs each")
+
+    if args.visualize:
+        svg_path = os.path.splitext(args.output)[0] + ".svg"
+        visualize_edgelist_file(args.output, output_path=svg_path)
 
 
 if __name__ == "__main__":
