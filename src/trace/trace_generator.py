@@ -1234,19 +1234,26 @@ def report_memory_footprint() -> None:
     docstring) using mem_footprint.py's standalone liveness model, plus which
     single step within a layer's forward/backward it's likely to occur in.
 
-    reuse_fwd_weights=REUSE_FWD_FSDP, activation_chkpt=ACTIVATION_CHKPT: both
-    mirror whatever --reuse-fwd-fsdp / --activation-chkpt were actually set
-    to for this run (both default false, i.e. re-fetch/recompute). The
-    generated trace's own backward pass makes exactly these same two
-    assumptions (see single_layer_backward_pass / single_layer_recompute),
-    so the footprint model needs to match them rather than use fixed values
-    -- otherwise this report would silently stop matching the trace as soon
-    as either flag changes.
+    reuse_fwd_weights=REUSE_FWD_FSDP mirrors --reuse-fwd-fsdp directly: both
+    this module's and mem_footprint.py's convention is "True = stays resident,
+    no re-fetch/re-gather needed".
+
+    activation_chkpt=not ACTIVATION_CHKPT, INVERTED rather than mirrored: the
+    two modules use opposite senses for this name. Here, ACTIVATION_CHKPT=True
+    means single_layer_backward_pass does NOT call single_layer_recompute --
+    activations stay resident, nothing is dropped-and-regenerated. In
+    mem_footprint.py, activation_chkpt=True means the standard ML "activation
+    checkpointing" technique -- activations ARE dropped after forward and a
+    recompute segment IS spliced into backward (see its layer_liveness
+    docstring). So "no recompute happens" is ACTIVATION_CHKPT=True here but
+    activation_chkpt=False there; passing the flag through unchanged would
+    have the footprint model silently analyze the opposite of what the
+    generated trace actually encodes.
     """
     mem_footprint.SUBSTITUTE_VALUES.clear()
     mem_footprint.SUBSTITUTE_VALUES.update(SUBSTITUTE_VALUES)
 
-    layer_repr = mem_footprint.LayerReprForFoorprint(activation_chkpt=ACTIVATION_CHKPT, reuse_fwd_weights=REUSE_FWD_FSDP)
+    layer_repr = mem_footprint.LayerReprForFoorprint(activation_chkpt=not ACTIVATION_CHKPT, reuse_fwd_weights=REUSE_FWD_FSDP)
     result = layer_repr.peak_rank_memory(pp_degree=PP, layers_per_stage=NUM_LAYERS // PP)
 
     bytes_peak = result["total_peak"] * BYTES_PER_ELEMENT
@@ -1317,10 +1324,11 @@ if __name__ == '__main__':
     parser.add_argument(
         "--activation-chkpt",
         action="store_true",
-        help="Assume activations are checkpointed (dropped after forward, never recomputed). Default: "
-             "false -- backward regenerates F1/F2 and K/V/Q/K_hat/V_hat/S/A via extra recompute nodes "
-             "(single_layer_recompute) right before it needs them. Pass --activation-chkpt to assume "
-             "they're already resident instead, with no recompute nodes."
+        help="Assume activations stay resident from forward through backward, with nothing dropped or "
+             "regenerated. Default: false -- backward instead regenerates F1/F2 and K/V/Q/K_hat/V_hat/S/A "
+             "via extra recompute nodes (single_layer_recompute) right before it needs them, as if they'd "
+             "been dropped after forward (the standard 'activation checkpointing' memory/compute tradeoff). "
+             "Pass --activation-chkpt to assume they're already resident instead, with no recompute nodes."
     )
 
     #I'm fixing the ordering for sharding axes based on how deep inside the model they are located
