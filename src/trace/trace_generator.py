@@ -242,7 +242,7 @@ def resolve_constants():
     GLOBAL_BATCH_SIZE = int(B.subs(SUBSTITUTE_VALUES))
     MICROBATCH_SIZE = int(M.subs(SUBSTITUTE_VALUES))
     NUM_MICROBATCHES = GLOBAL_BATCH_SIZE // (MICROBATCH_SIZE * DP)
-    RESOLVED_SHARDING_FORMULAS = {key: formula.subs(SUBSTITUTE_VALUES) for key, formula in sharding_formulas.items()}
+    RESOLVED_SHARDING_FORMULAS = {key: formula.subs(SUBSTITUTE_VALUES) * BYTES_PER_ELEMENT for key, formula in sharding_formulas.items()}
 
 
 
@@ -1349,16 +1349,21 @@ if __name__ == '__main__':
         pp: args.pp,
         tp: args.tp
     }
-    resolve_constants()
 
     if args.single_comm:
         MAX_COMM_GROUPS_PER_COMM = 1
     else:
         MAX_COMM_GROUPS_PER_COMM = 1000000
 
+    #Must be set before resolve_constants(), which bakes the current
+    #BYTES_PER_ELEMENT into RESOLVED_SHARDING_FORMULAS (comm node sizes) --
+    #resolving first and overriding this after would silently keep comm
+    #sizes at the stale module-level default regardless of --bytes-per-element.
     BYTES_PER_ELEMENT = args.bytes_per_element
     REUSE_FWD_FSDP = args.reuse_fwd_fsdp
     ACTIVATION_CHKPT = args.activation_chkpt
+
+    resolve_constants()
 
     sharding_axes_symbols = [dp,cp,pp,tp]
     sharding_axes = [s.subs(SUBSTITUTE_VALUES) for s in sharding_axes_symbols]
