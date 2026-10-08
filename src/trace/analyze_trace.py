@@ -16,6 +16,7 @@ import json
 import re
 import sys
 from collections import Counter
+import tracegen.compress as compress
 
 # Which parallelism axis a COMM node belongs to isn't stored as its own field
 # -- it has to be inferred from the node name, going by trace_generator.py's
@@ -39,9 +40,9 @@ def classify_axis(name: str) -> str:
 
 
 def count_collectives(trace_path: str, include_dummy: bool = False) -> Counter:
-    with open(trace_path) as f:
-        trace = json.load(f)
-
+    
+    trace = compress.load_trace_json(trace_path)
+    
     types = {"COMM", "DUMMY"} if include_dummy else {"COMM"}
     counts: Counter = Counter()
     for node in trace["nodes"]:
@@ -61,8 +62,8 @@ def write_csv(counts: Counter, output) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Report collective_type,size,number_of_times_encountered for a trace.json.")
-    parser.add_argument("--trace", type=str, required=True, help="Path to the trace.json file.")
-    parser.add_argument("--output", type=str, default=None, help="Output CSV path (default: stdout).")
+    parser.add_argument("trace", type=str, help="Path to the trace.json file.")
+    parser.add_argument("--output", "-o", type=str, default=None, help="Output CSV path (default: stdout).")
     parser.add_argument("--include-dummy", action="store_true", help="Also count DUMMY nodes (degree-1 collectives collapsed to zero-cost markers).")
     args = parser.parse_args()
 
