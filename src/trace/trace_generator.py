@@ -12,6 +12,7 @@ import numpy as np
 import enum
 
 from tracegen import mem_footprint
+from tracegen import compress
 
 L = sympy.symbols("L")
 H_k = sympy.symbols("H_k")
@@ -1215,18 +1216,13 @@ def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
     json_obj = {
         "nodes": trace,
     }
-    #json.dump(json_obj, f, ...) always uses the slow pure-Python encoder in
-    #CPython's stdlib json module -- it calls iterencode() without
-    #_one_shot=True internally, which is one of the C-accelerated encoder's
-    #requirements, so it falls back to the pure-Python chunked generator
-    #regardless of indent. json.dumps() does pass _one_shot=True by default,
-    #which engages the C encoder (indent=None is the other requirement, so
-    #this also drops pretty-printing -- for a trace this size nobody's
-    #reading it by eye anyway). Measured ~5-8x faster on a representative
-    #multi-million-node payload; this was the dominant cost in trace
-    #generation for large configs, well past MatMul/FLOPs computation.
-    with open(filepath, "w") as f:
-        f.write(json.dumps(json_obj))
+    #Writes zstd-compressed directly -- the uncompressed form (tens of GB for
+    #this project's larger configs) is never written to disk at all. See
+    #compress.py's module docstring for the json.dumps()-vs-json.dump() and
+    #compression-level reasoning; run compress.py directly (`python
+    #src/trace/compress.py decompress ...`) to materialize a plain .json for
+    #manual inspection.
+    compress.write_compressed_trace(json_obj, filepath)
 
 def report_memory_footprint() -> None:
     """Computes and prints the peak per-rank memory footprint (worst-case
@@ -1311,7 +1307,7 @@ if __name__ == '__main__':
     parser.add_argument("--cp",type=int,default=1,help="Sequence parallelism degree")
     parser.add_argument("--pp",type=int,default=4,help="Pipeline parallelism degree")
     parser.add_argument("--tp",type=int,default=8,help="Tensor parallelism degree")
-    parser.add_argument("--output","-o",type=str,default="trace.json",help="Output file path for the generated trace JSON")
+    parser.add_argument("--output","-o",type=str,default="trace.json.zst",help="Output file path for the generated trace (written zstd-compressed; a .zst suffix is appended if missing)")
     parser.add_argument("--bytes-per-element",type=int,default=2,help="Bytes per element for MatMul tensor sizes (default: 2, bf16/fp16)")
     parser.add_argument(
         "--reuse-fwd-fsdp",
@@ -1388,11 +1384,12 @@ if __name__ == '__main__':
     construct_1f1b_schedule(NUM_MICROBATCHES)
     gen_end_time = time.time()
     print(f"Generated trace in {gen_end_time - gen_start_time:.2f}s")
-    
+
+    output_path = args.output if compress.is_compressed(args.output) else args.output + compress.COMPRESSED_SUFFIX
     wr_start_time = time.time()
-    write_trace_to_json(list(Node._all_nodes.values()), args.output)
+    write_trace_to_json(list(Node._all_nodes.values()), output_path)
     wr_end_time = time.time()
-    print(f"Wrote trace to {args.output} in {wr_end_time - wr_start_time:.2f}s")
+    print(f"Wrote trace to {output_path} in {wr_end_time - wr_start_time:.2f}s")
     
     report_memory_footprint()
 
