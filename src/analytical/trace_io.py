@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import json
-
 import networkx as nx
+
+from tracegen.compress import load_trace_json
 
 
 def load_trace(path: str) -> nx.DiGraph:
     """Returns a dag with one node per trace node (attrs preserved, including the
-    literal comm_group NPU-id list), edges dep -> node.
+    literal comm_group NPU-id list), edges dep -> node. `path` may be a plain
+    .json trace or a zstd-compressed .json.zst one (see compress.py) -- either
+    way the data is fully decompressed in memory, never to a file on disk.
     """
-    with open(path) as f:
-        data = json.load(f)
+    data = load_trace_json(path)
 
     graph = nx.DiGraph()
     for node in data["nodes"]:
