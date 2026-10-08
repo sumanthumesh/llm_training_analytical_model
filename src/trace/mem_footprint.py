@@ -509,11 +509,41 @@ class LayerReprForFoorprint:
             for i in range(last_fwd_idx + 1, first_bwd_idx):
                 steps[i].footprint = [t for t in steps[i].footprint if t.name != name]
 
-    def peak_rank_memory(self, pp_degree:int, layers_per_stage:int, in_flight:int=None) -> Dict[str, int]:
-        """Peak single-rank (one pipeline stage) footprint, in elements (not
-        bytes -- multiply by a dtype width yourself, same convention as
-        Tensor.size), honoring this instance's activation_chkpt /
-        reuse_fwd_weights policy.
+    def optimizer_state_bytes_per_rank(
+        self,
+        dp_degree:int,
+        layers_per_stage:int,
+        master_bytes_per_param:int=4,
+        momentum_bytes_per_param:int=4,
+        variance_bytes_per_param:int=4,
+    ) -> int:
+        """Per-rank bytes for the FSDP-sharded optimizer state: an fp32
+        master weight copy plus Adam's fp32 momentum (exp_avg) and variance
+        (exp_avg_sq), one triple per parameter, for every layer on this
+        pipeline stage. Always fp32 (4+4+4=12 bytes/param by default) by
+        construction -- independent of whatever precision the compute-path
+        weights/activations/gradients use (that's bytes_per_element,
+        elsewhere) -- so this is computed directly in bytes rather than
+        elements, and is NOT part of peak_rank_memory's total_peak; it's a
+        separate, always-resident contribution: unlike the gathered working
+        copy (which appears/disappears across the fwd/bwd gap per
+        reuse_fwd_weights), the sharded master+momentum+variance state never
+        leaves memory for the life of the run. Sharded 1/dp_degree per rank,
+        same as the working-copy weights.
+        """
+        per_layer_params = int(sum(t.size for t in self.weights.values()).subs(SUBSTITUTE_VALUES))
+        total_params_this_stage = per_layer_params * layers_per_stage
+        bytes_per_param = master_bytes_per_param + momentum_bytes_per_param + variance_bytes_per_param
+        return (total_params_this_stage * bytes_per_param) // dp_degree
+
+    def peak_rank_memory(self, pp_degree:int, dp_degree:int, layers_per_stage:int, bytes_per_element:int, in_flight:int=None) -> Dict[str, int]:
+        """Peak single-rank (one pipeline stage) footprint, honoring this
+        instance's activation_chkpt / reuse_fwd_weights policy. Returns both
+        an elements-denominated breakdown (persistent_per_layer etc., same
+        convention as Tensor.size -- for comparing step-to-step shapes) and a
+        final total_peak_bytes that folds in optimizer_state_bytes_per_rank,
+        which is NOT expressible in elements (see optimizer_state_bytes_per_rank)
+        and so can't be part of total_peak itself.
 
         Requires SUBSTITUTE_VALUES to already be populated with concrete
         values for every symbol Tensor shapes use (D_h, H_q, S, M, cp, tp,
@@ -552,6 +582,14 @@ class LayerReprForFoorprint:
         happens. "peak_step_name" names that step (forward step name, a bwd_*
         name, or a recompute.*-prefixed name if activation_chkpt spliced a
         recompute segment in ahead of it); "peak_step_phase" says which half.
+
+        total_peak_bytes = total_peak * bytes_per_element + optimizer_state_bytes_per_rank
+        -- the former is the active working set (compute-path precision, the
+        only thing that varies with bytes_per_element), the latter is the
+        always-resident fp32 master+momentum+variance shard (see
+        optimizer_state_bytes_per_rank) -- fixed regardless of
+        bytes_per_element, and present even while this stage is otherwise
+        completely idle.
         """
         if in_flight is None:
             in_flight = pp_degree
@@ -573,6 +611,9 @@ class LayerReprForFoorprint:
 
         active_microbatch_peak = (layers_per_stage - 1) * persistent_per_layer + active_transient_peak
         other_in_flight_contribution = (in_flight - 1) * layers_per_stage * persistent_per_layer
+        total_peak = other_in_flight_contribution + active_microbatch_peak
+
+        optimizer_bytes = self.optimizer_state_bytes_per_rank(dp_degree, layers_per_stage)
 
         return {
             "persistent_per_layer": persistent_per_layer,
@@ -580,7 +621,9 @@ class LayerReprForFoorprint:
             "bwd_peak_per_layer": bwd_peak_per_layer,
             "active_microbatch_peak": active_microbatch_peak,
             "other_in_flight_contribution": other_in_flight_contribution,
-            "total_peak": other_in_flight_contribution + active_microbatch_peak,
+            "total_peak": total_peak,
+            "optimizer_state_bytes_per_rank": optimizer_bytes,
+            "total_peak_bytes": total_peak * bytes_per_element + optimizer_bytes,
             "peak_step_name": peak_step_name,
             "peak_step_phase": peak_step_phase,
         }
