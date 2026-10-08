@@ -1250,18 +1250,28 @@ def report_memory_footprint() -> None:
     mem_footprint.SUBSTITUTE_VALUES.update(SUBSTITUTE_VALUES)
 
     layer_repr = mem_footprint.LayerReprForFoorprint(activation_chkpt=not ACTIVATION_CHKPT, reuse_fwd_weights=REUSE_FWD_FSDP)
-    result = layer_repr.peak_rank_memory(pp_degree=PP, layers_per_stage=NUM_LAYERS // PP)
+    result = layer_repr.peak_rank_memory(
+        pp_degree=PP,
+        dp_degree=DP,
+        layers_per_stage=NUM_LAYERS // PP,
+        bytes_per_element=BYTES_PER_ELEMENT,
+    )
 
-    bytes_peak = result["total_peak"] * BYTES_PER_ELEMENT
+    BYTES_TO_GB = 2**30
+
+    working_set_bytes = result["total_peak"] * BYTES_PER_ELEMENT
+    optimizer_bytes = result["optimizer_state_bytes_per_rank"]
     print()
     print("=== Peak memory footprint (worst-case rank, pipeline stage 0) ===")
-    print(f"  assumptions: reuse_fwd_weights={REUSE_FWD_FSDP}, activation_chkpt={ACTIVATION_CHKPT}, {BYTES_PER_ELEMENT} bytes/element")
-    print(f"  total_peak: {result['total_peak']:,} elements = {bytes_peak / 1e9:.2f} GB")
-    print(f"  likely step: '{result['peak_step_name']}' ({result['peak_step_phase']} pass)")
-    print(f"  breakdown: persistent_per_layer={result['persistent_per_layer']:,}  "
-          f"fwd_peak_per_layer={result['fwd_peak_per_layer']:,}  "
+    print(f"Assumptions: reuse_fwd_weights={REUSE_FWD_FSDP}, activation_chkpt={ACTIVATION_CHKPT}, {BYTES_PER_ELEMENT} bytes/element, dp={DP}")
+    print(f"total_peak_bytes: {result['total_peak_bytes'] / BYTES_TO_GB:.2f} GB "
+          f"(working set {result['total_peak']:,} elements = {working_set_bytes / BYTES_TO_GB:.2f} GB "
+          f"+ optimizer state {optimizer_bytes / BYTES_TO_GB:.2f} GB)")
+    print(f"likely step: '{result['peak_step_name']}' ({result['peak_step_phase']} pass)")
+    print(f"breakdown:\npersistent_per_layer={result['persistent_per_layer']:,}\n"
+          f"fwd_peak_per_layer={result['fwd_peak_per_layer']:,}\n"
           f"bwd_peak_per_layer={result['bwd_peak_per_layer']:,}")
-    print(f"             active_microbatch_peak={result['active_microbatch_peak']:,}  "
+    print(f"active_microbatch_peak={result['active_microbatch_peak']:,}\n"
           f"other_in_flight_contribution={result['other_in_flight_contribution']:,}")
 
 
@@ -1326,6 +1336,7 @@ if __name__ == '__main__':
              "been dropped after forward (the standard 'activation checkpointing' memory/compute tradeoff). "
              "Pass --activation-chkpt to assume they're already resident instead, with no recompute nodes."
     )
+    parser.add_argument("-m","--mem-only",action="store_true",help="Use this flag if you just want to know estimated memory footprint only and aren't interested in trace generation")
 
     #I'm fixing the ordering for sharding axes based on how deep inside the model they are located
     #dp replicates entire model
@@ -1385,17 +1396,18 @@ if __name__ == '__main__':
 
     # write_trace_to_json(list(all_nodes_single_layer_single_microbatch.values()), "trace_single_layer.json")
 
-    gen_start_time = time.time()
-    construct_1f1b_schedule(NUM_MICROBATCHES)
-    gen_end_time = time.time()
-    print(f"Generated trace in {gen_end_time - gen_start_time:.2f}s")
+    if not args.mem_only:
+        gen_start_time = time.time()
+        construct_1f1b_schedule(NUM_MICROBATCHES)
+        gen_end_time = time.time()
+        print(f"Generated trace in {gen_end_time - gen_start_time:.2f}s")
 
-    output_path = args.output if compress.is_compressed(args.output) else args.output + compress.COMPRESSED_SUFFIX
-    wr_start_time = time.time()
-    write_trace_to_json(list(Node._all_nodes.values()), output_path)
-    wr_end_time = time.time()
-    print(f"Wrote trace to {output_path} in {wr_end_time - wr_start_time:.2f}s")
-    
+        output_path = args.output if compress.is_compressed(args.output) else args.output + compress.COMPRESSED_SUFFIX
+        wr_start_time = time.time()
+        write_trace_to_json(list(Node._all_nodes.values()), output_path)
+        wr_end_time = time.time()
+        print(f"Wrote trace to {output_path} in {wr_end_time - wr_start_time:.2f}s")
+
     report_memory_footprint()
 
     print((per_layer_weight_sizes()*tp*(L-2)+2*V*D).subs(SUBSTITUTE_VALUES))
