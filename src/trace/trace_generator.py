@@ -62,11 +62,13 @@ BYTES_PER_ELEMENT = 2
 #-- overridden from --reuse-fwd-fsdp; False (the flag's own default) means
 #backward re-fetches them itself on its first microbatch on each stage.
 REUSE_FWD_FSDP = False
-#Whether activations are checkpointed (dropped after forward, regenerated
-#via single_layer_recompute right before backward needs them) rather than
-#kept resident the whole fwd/bwd gap -- overridden from --activation-chkpt;
-#False (the flag's own default) means recompute nodes get added.
-ACTIVATION_CHKPT = False
+#Whether activations are recomputed in the backward pass (dropped after
+#forward, regenerated via single_layer_recompute right before backward
+#needs them -- the standard "activation checkpointing" memory/compute
+#tradeoff) rather than kept resident the whole fwd/bwd gap -- overridden
+#from --recompute-activations; False (the flag's own default) means
+#activations stay resident and no recompute nodes get added.
+RECOMPUTE_ACTIVATIONS = False
 
 @dataclass
 class Node:
@@ -671,7 +673,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         ]
     ]
     ffn_backward_dep_id = post_fsdp_sync_node.id
-    if not ACTIVATION_CHKPT:
+    if RECOMPUTE_ACTIVATIONS:
         ffn_backward_dep_id = single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, "ffn", post_fsdp_sync_node.id)
 
     comp_ffn_backward_node = make_comp_node(
@@ -724,7 +726,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
         ]
     ]
     attn_backward_dep_id = tp_all_reduce_ffn_sync_node.id
-    if not ACTIVATION_CHKPT:
+    if RECOMPUTE_ACTIVATIONS:
         attn_backward_dep_id = single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, "attn", tp_all_reduce_ffn_sync_node.id)
 
     comp_attn_backward_node = make_comp_node(
@@ -1230,26 +1232,17 @@ def report_memory_footprint() -> None:
     docstring) using mem_footprint.py's standalone liveness model, plus which
     single step within a layer's forward/backward it's likely to occur in.
 
-    reuse_fwd_weights=REUSE_FWD_FSDP mirrors --reuse-fwd-fsdp directly: both
-    this module's and mem_footprint.py's convention is "True = stays resident,
-    no re-fetch/re-gather needed".
-
-    activation_chkpt=not ACTIVATION_CHKPT, INVERTED rather than mirrored: the
-    two modules use opposite senses for this name. Here, ACTIVATION_CHKPT=True
-    means single_layer_backward_pass does NOT call single_layer_recompute --
-    activations stay resident, nothing is dropped-and-regenerated. In
-    mem_footprint.py, activation_chkpt=True means the standard ML "activation
-    checkpointing" technique -- activations ARE dropped after forward and a
-    recompute segment IS spliced into backward (see its layer_liveness
-    docstring). So "no recompute happens" is ACTIVATION_CHKPT=True here but
-    activation_chkpt=False there; passing the flag through unchanged would
-    have the footprint model silently analyze the opposite of what the
-    generated trace actually encodes.
+    reuse_fwd_weights=REUSE_FWD_FSDP mirrors --reuse-fwd-fsdp directly, and
+    activation_recompute=RECOMPUTE_ACTIVATIONS mirrors --recompute-activations
+    directly -- both this module's and mem_footprint.py's conventions now
+    agree on what True means for each ("stays resident, no re-fetch/re-gather
+    needed" and "dropped after forward, regenerated via a recompute segment"
+    respectively), so both pass straight through with no inversion needed.
     """
     mem_footprint.SUBSTITUTE_VALUES.clear()
     mem_footprint.SUBSTITUTE_VALUES.update(SUBSTITUTE_VALUES)
 
-    layer_repr = mem_footprint.LayerReprForFoorprint(activation_chkpt=not ACTIVATION_CHKPT, reuse_fwd_weights=REUSE_FWD_FSDP)
+    layer_repr = mem_footprint.LayerReprForFoorprint(activation_recompute=RECOMPUTE_ACTIVATIONS, reuse_fwd_weights=REUSE_FWD_FSDP)
     result = layer_repr.peak_rank_memory(
         pp_degree=PP,
         dp_degree=DP,
@@ -1263,7 +1256,7 @@ def report_memory_footprint() -> None:
     optimizer_bytes = result["optimizer_state_bytes_per_rank"]
     print()
     print("=== Peak memory footprint (worst-case rank, pipeline stage 0) ===")
-    print(f"Assumptions: reuse_fwd_weights={REUSE_FWD_FSDP}, activation_chkpt={ACTIVATION_CHKPT}, {BYTES_PER_ELEMENT} bytes/element, dp={DP}")
+    print(f"Assumptions: reuse_fwd_weights={REUSE_FWD_FSDP}, recompute_activations={RECOMPUTE_ACTIVATIONS}, {BYTES_PER_ELEMENT} bytes/element, dp={DP}")
     print(f"total_peak_bytes: {result['total_peak_bytes'] / BYTES_TO_GB:.2f} GB "
           f"(working set {result['total_peak']:,} elements = {working_set_bytes / BYTES_TO_GB:.2f} GB "
           f"+ optimizer state {optimizer_bytes / BYTES_TO_GB:.2f} GB)")
@@ -1328,13 +1321,14 @@ if __name__ == '__main__':
              "(the original fsdp_all_gather-on-mb0-forward-only pattern, no extra backward gather)."
     )
     parser.add_argument(
-        "--activation-chkpt",
+        "--recompute-activations",
         action="store_true",
-        help="Assume activations stay resident from forward through backward, with nothing dropped or "
-             "regenerated. Default: false -- backward instead regenerates F1/F2 and K/V/Q/K_hat/V_hat/S/A "
-             "via extra recompute nodes (single_layer_recompute) right before it needs them, as if they'd "
-             "been dropped after forward (the standard 'activation checkpointing' memory/compute tradeoff). "
-             "Pass --activation-chkpt to assume they're already resident instead, with no recompute nodes."
+        help="Recompute activations in the backward pass instead of keeping them resident -- the standard "
+             "'activation checkpointing' memory/compute tradeoff. Default: false -- activations stay "
+             "resident from forward through backward, nothing dropped or regenerated. Pass "
+             "--recompute-activations to instead drop F1/F2 and K/V/Q/K_hat/V_hat/S/A after forward and "
+             "regenerate them via extra recompute nodes (single_layer_recompute) right before backward "
+             "needs them."
     )
     parser.add_argument("-m","--mem-only",action="store_true",help="Use this flag if you just want to know estimated memory footprint only and aren't interested in trace generation")
 
@@ -1372,7 +1366,7 @@ if __name__ == '__main__':
     #sizes at the stale module-level default regardless of --bytes-per-element.
     BYTES_PER_ELEMENT = args.bytes_per_element
     REUSE_FWD_FSDP = args.reuse_fwd_fsdp
-    ACTIVATION_CHKPT = args.activation_chkpt
+    RECOMPUTE_ACTIVATIONS = args.recompute_activations
 
     resolve_constants()
 

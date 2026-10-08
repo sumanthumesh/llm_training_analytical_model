@@ -30,8 +30,8 @@ class Tensor:
         self.size = sympy.prod(self.shape)
 
 class LayerReprForFoorprint:
-    def __init__(self,activation_chkpt:bool,reuse_fwd_weights:bool):
-        self.activation_chkpt = activation_chkpt
+    def __init__(self,activation_recompute:bool,reuse_fwd_weights:bool):
+        self.activation_recompute = activation_recompute
         self.reuse_fwd_weights = reuse_fwd_weights
         self.weights = self.all_weights()
         self.fwd_tensors = self.fwd_activations()
@@ -446,8 +446,8 @@ class LayerReprForFoorprint:
 
     def layer_liveness(self) -> List["LayerReprForFoorprint.Step"]:
         """Returns fwd_steps() + bwd_steps() (with recompute segments spliced
-        in if activation_chkpt) with .footprint populated on every step,
-        honoring both reuse_fwd_weights and activation_chkpt.
+        in if activation_recompute) with .footprint populated on every step,
+        honoring both reuse_fwd_weights and activation_recompute.
 
         The base pass is always the single combined-sequence liveness (
         bridges any tensor used on both sides of the fwd/bwd gap by default).
@@ -459,7 +459,7 @@ class LayerReprForFoorprint:
         - reuse_fwd_weights=False: weights are dropped across the fwd/bwd
           gap (see _drop_tensors_across_gap) -- die at their natural forward
           last-use, reappear fresh at their first backward use.
-        - activation_chkpt=True: every forward activation except X and RA
+        - activation_recompute=True: every forward activation except X and RA
           (the saved checkpoints) is dropped across the gap the same way,
           but a recompute segment is spliced into backward first so each one
           has a real step producing it again before backward actually needs
@@ -467,7 +467,7 @@ class LayerReprForFoorprint:
         """
         fwd = self.fwd_steps()
         bwd = self.bwd_steps()
-        if self.activation_chkpt:
+        if self.activation_recompute:
             bwd = self._splice_recompute(bwd)
         steps = fwd + bwd
         fwd_len = len(fwd)
@@ -478,7 +478,7 @@ class LayerReprForFoorprint:
         drop_names:Set[str] = set()
         if not self.reuse_fwd_weights:
             drop_names |= set(self.weights.keys())
-        if self.activation_chkpt:
+        if self.activation_recompute:
             drop_names |= set(self.fwd_tensors.keys()) - {"X", "RA"}
 
         if drop_names:
@@ -538,7 +538,7 @@ class LayerReprForFoorprint:
 
     def peak_rank_memory(self, pp_degree:int, dp_degree:int, layers_per_stage:int, bytes_per_element:int, in_flight:int=None) -> Dict[str, int]:
         """Peak single-rank (one pipeline stage) footprint, honoring this
-        instance's activation_chkpt / reuse_fwd_weights policy. Returns both
+        instance's activation_recompute / reuse_fwd_weights policy. Returns both
         an elements-denominated breakdown (persistent_per_layer etc., same
         convention as Tensor.size -- for comparing step-to-step shapes) and a
         final total_peak_bytes that folds in optimizer_state_bytes_per_rank,
@@ -580,7 +580,7 @@ class LayerReprForFoorprint:
         layers on this stage) is a constant background present throughout, so
         the step achieving active_transient_peak IS where the global peak
         happens. "peak_step_name" names that step (forward step name, a bwd_*
-        name, or a recompute.*-prefixed name if activation_chkpt spliced a
+        name, or a recompute.*-prefixed name if activation_recompute spliced a
         recompute segment in ahead of it); "peak_step_phase" says which half.
 
         total_peak_bytes = total_peak * bytes_per_element + optimizer_state_bytes_per_rank
