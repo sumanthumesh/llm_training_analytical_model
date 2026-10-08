@@ -7,6 +7,28 @@ from analytical.collectives import HopCandidates, precompute_node
 from analytical.topology import Topology, build_routing_table, draw_topology, parse_edgelist
 from analytical.trace_io import load_trace
 
+from typing import Dict,Set,List,Tuple
+import time
+from dataclasses import dataclass
+
+class RuntimeRecord:
+    def __init__(self):
+        self.timers:Dict[str,List[float]] = dict()
+
+    def start(self,name):
+        assert name not in self.timers.keys(), f"{name} already recorded"
+        self.timers[name] = [time.time(),0]
+
+    def end(self,name):
+        assert name in self.timers.keys(), f"{name} not recorded"
+        self.timers[name][1] = time.time()
+
+    def report(self):
+        for phase,times in self.timers.items():
+            print(f"{phase}:{times[0]}-{times[1]},{times[1]-times[0]}s")
+
+walltime_recorder = RuntimeRecord()
+
 
 class LinkManager:
     """All-or-nothing physical link reservation, with the physical path for
@@ -180,12 +202,19 @@ def simulate(
     track_overlap: bool = False,
     fixed_overhead_sec: float = 0.0,
 ) -> float:
+    print(f"Compute routing table")
+    walltime_recorder.start("routing_table")
     routing_table = build_routing_table(topo)
+    walltime_recorder.end("routing_table")
+    print(f"Preprocess nodes")
+    walltime_recorder.start("preprocess_nodes")
     for node_id, node in graph.nodes(data=True):
         node["hop_candidates"], node["duration"] = precompute_node(
             node, routing_table, peak_perf_tflops, local_mem_bw_gbps, fixed_overhead_sec
         )
-
+    walltime_recorder.end("preprocess_nodes")
+    print(f"Start simpy simulation")
+    walltime_recorder.start("simpy_simulation")
     env = simpy.Environment()
     link_manager = LinkManager(env, topo)
     done_events = {node_id: env.event() for node_id in graph.nodes}
@@ -194,6 +223,10 @@ def simulate(
         env.process(run_node(env, node_id, graph, link_manager, done_events, verbose, track_overlap))
 
     env.run()
+    walltime_recorder.end("simpy_simulation")
+
+    walltime_recorder.report()
+
     return env.now
 
 
@@ -209,11 +242,19 @@ if __name__ == "__main__":
     parser.add_argument("--perfetto-trace", type=str, default=None, help="Write a Perfetto/Chrome-trace-format JSON to this path (open at ui.perfetto.dev).")
     args = parser.parse_args()
 
+    print(f"Parsing Edgelist")
+    walltime_recorder.start("parse_edgelist")
     physical_topology = parse_edgelist(args.topology)
+    walltime_recorder.end("parse_edgelist")
     # draw_topology(physical_topology, "topology.png")
 
+    print(f"Loading trace")
+    walltime_recorder.start("load_trace")
     dag = load_trace(args.trace)
+    walltime_recorder.end("load_trace")
     track_overlap = args.overlap or args.perfetto_trace is not None
+    
+    print(f"Begin Simulation")
     finish_time = simulate(
         physical_topology,
         dag,
