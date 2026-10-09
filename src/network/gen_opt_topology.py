@@ -64,10 +64,10 @@ def generate_dgx_edgelist(
         leaf = f"s{domain}"
         for local_idx in range(npus_per_domain):
             host = domain * npus_per_domain + local_idx
-            lines.append(f"link h{host} {leaf}")
+            lines.append(f"link h{host} {leaf} direction bi")
             if multi_domain:
                 lines.append(
-                    f"link h{host} {spine} speed_Gbps {outer_bandwidth_gbps} latency_ns {outer_latency_ns}"
+                    f"link h{host} {spine} direction bi speed_Gbps {outer_bandwidth_gbps} latency_ns {outer_latency_ns}"
                 )
 
     return "\n".join(lines) + "\n"
@@ -223,7 +223,7 @@ def generate_opt_edgelist(
         leaf = f"s{domain}"
         for local_idx in range(npus_per_domain):
             host = domain * npus_per_domain + local_idx
-            lines.append(f"link h{host} {leaf}")
+            lines.append(f"link h{host} {leaf} direction bi")
     lines.append("")
 
     axis_ratio = {"pp": pp_ratio, "cp": cp_ratio, "dp": dp_ratio}
@@ -241,7 +241,7 @@ def generate_opt_edgelist(
         inner_switch = f"s{domain}"
         for axis in active_axes:
             lines.append(
-                f"link {inner_switch} {outer_switch(axis, domain)} "
+                f"link {inner_switch} {outer_switch(axis, domain)} direction bi "
                 f"speed_Gbps {outer_bandwidth_gbps * axis_ratio[axis]} latency_ns 0 axis_id 0"
             )
     lines.append("")
@@ -261,7 +261,7 @@ def generate_opt_edgelist(
                 print(f"    Generating link for domain {domain}")
                 next_domain = ring[(i + 1) % len(ring)]
                 lines.append(
-                    f"link {outer_switch(axis, domain)} {outer_switch(axis, next_domain)} "
+                    f"link {outer_switch(axis, domain)} {outer_switch(axis, next_domain)} direction uni "
                     f"speed_Gbps {outer_bandwidth_gbps*axis_ratio[axis]} latency_ns {outer_latency_ns} axis_id {axis_id[axis]}"
                 )
         lines.append("\n")
