@@ -1199,7 +1199,7 @@ def matmul_to_json(matmul:MatMul) -> Dict:
         "tensor_size_numeric": matmul.tensor_size_numeric,
     }
 
-def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
+def write_trace_to_json(nodes:List[Node], filepath:str, compressed:bool=True) -> None:
     #Ignoring comm group deduplication (CommGroupTracker) for now — comm_group is written
     #as the literal list of involved NPU ids per node, for visual inspection.
     trace = [
@@ -1218,13 +1218,18 @@ def write_trace_to_json(nodes:List[Node], filepath:str) -> None:
     json_obj = {
         "nodes": trace,
     }
-    #Writes zstd-compressed directly -- the uncompressed form (tens of GB for
-    #this project's larger configs) is never written to disk at all. See
-    #compress.py's module docstring for the json.dumps()-vs-json.dump() and
-    #compression-level reasoning; run compress.py directly (`python
-    #src/trace/compress.py decompress ...`) to materialize a plain .json for
-    #manual inspection.
-    compress.write_compressed_trace(json_obj, filepath)
+    #Writes zstd-compressed directly by default -- the uncompressed form
+    #(tens of GB for this project's larger configs) is never written to disk
+    #at all. See compress.py's module docstring for the json.dumps()-vs-
+    #json.dump() and compression-level reasoning; run compress.py directly
+    #(`python src/trace/compress.py decompress ...`) to materialize a plain
+    #.json for manual inspection, or pass compressed=False here to skip
+    #compression entirely (e.g. for a small trace you want to read directly).
+    if compressed:
+        compress.write_compressed_trace(json_obj, filepath)
+    else:
+        with open(filepath, "w") as f:
+            json.dump(json_obj, f)
 
 def report_memory_footprint() -> None:
     """Computes and prints the peak per-rank memory footprint (worst-case
