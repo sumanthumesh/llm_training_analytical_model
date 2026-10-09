@@ -99,7 +99,7 @@ def _ring_order(switch_graph: nx.Graph, nodes: set[str]) -> list[str]:
     return order
 
 
-_AXIS_ID_NAMES = {0: "pp", 1: "cp", 2: "dp"}
+_AXIS_ID_NAMES = {0: "local", 1: "pp", 2: "cp", 3: "dp"}
 
 
 def _axis_groups(switch_graph: nx.Graph) -> list[tuple[str | None, list[list[str]]]]:
