@@ -99,7 +99,7 @@ def _ring_order(switch_graph: nx.Graph, nodes: set[str]) -> list[str]:
     return order
 
 
-_AXIS_ID_NAMES = {0: "local", 1: "pp", 2: "cp", 3: "dp"}
+_AXIS_ID_NAMES = {0: "local", 1: "dp", 2: "cp", 3: "pp"}
 
 
 def _axis_groups(switch_graph: nx.Graph) -> list[tuple[str | None, list[list[str]]]]:
@@ -209,6 +209,29 @@ def _draw_two_tier(ax, topo: Topology, switch_graph: nx.Graph, hub: str) -> None
     ax.set_title(f"Two-tier topology (hub: {hub}, {len(leaves)} leaf switch(es), {len(topo.hosts)} hosts)")
 
 
+def _place_ring_components(components: list[list[str]], radius: float) -> tuple[dict[str, tuple[float, float]], dict[str, float]]:
+    """Lays one axis's disjoint ring components around a single shared
+    circle of the given radius, concatenated with a gap between components
+    so separate ring instances of that axis stay visually distinct (e.g. a
+    PP ring of size 4 shared by dp=2 x cp=3 instances -> 6 separate arcs on
+    the same circle, not one merged blob).
+    """
+    pos: dict[str, tuple[float, float]] = {}
+    angle: dict[str, float] = {}
+    num_components = len(components)
+    gap = 0.15 * (2 * math.pi / max(num_components, 1))
+    arc_per_component = (2 * math.pi - gap * num_components) / max(num_components, 1)
+    start = 0.0
+    for ring in components:
+        L = len(ring)
+        for i, switch in enumerate(ring):
+            theta = start + (arc_per_component * i / L if L > 1 else arc_per_component / 2)
+            pos[switch] = (radius * math.cos(theta), radius * math.sin(theta))
+            angle[switch] = theta
+        start += arc_per_component + gap
+    return pos, angle
+
+
 def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph) -> None:
     """Every switch sits at exactly one position, placed around a single
     shared circle by the axis with the biggest ring (fewest, largest
@@ -217,6 +240,11 @@ def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph) -> None:
     not geometrically circular themselves, but every line drawn is a real
     switch_graph edge, so the picture never implies adjacency that isn't
     there (see the two-tier star mis-render this replaced).
+
+    Only valid when every switch actually participates in some axis's ring
+    -- see _draw_two_level_ring for gen_opt_topology.py's inner-hub design,
+    where that assumption doesn't hold and this layout would otherwise dump
+    every unplaced switch at the origin.
     """
     axis_groups = _axis_groups(switch_graph)
     num_axes = len(axis_groups)
@@ -227,19 +255,7 @@ def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph) -> None:
     # circle, with a gap between components so separate ring instances of
     # that axis stay visually distinct.
     _, primary = axis_groups[0]
-    num_components = len(primary)
-    gap = 0.15 * (2 * math.pi / max(num_components, 1))
-    arc_per_component = (2 * math.pi - gap * num_components) / max(num_components, 1)
-    pos: dict[str, tuple[float, float]] = {}
-    angle: dict[str, float] = {}
-    start = 0.0
-    for ring in primary:
-        L = len(ring)
-        for i, switch in enumerate(ring):
-            theta = start + (arc_per_component * i / L if L > 1 else arc_per_component / 2)
-            pos[switch] = (radius * math.cos(theta), radius * math.sin(theta))
-            angle[switch] = theta
-        start += arc_per_component + gap
+    pos, angle = _place_ring_components(primary, radius)
 
     for switch in topo.switches:
         if switch not in pos:
@@ -273,6 +289,84 @@ def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph) -> None:
     ax.set_title(f"Ring topology ({num_axes} axis/axes, {len(topo.switches)} interposer(s), {len(topo.hosts)} hosts)")
 
 
+def _draw_two_level_ring(ax, topo: Topology, switch_graph: nx.Graph) -> None:
+    """gen_opt_topology.py's inner-hub design: each interposer's inner
+    switch carries no ring edges of its own, only a "local" spoke
+    (axis_id 0) to up to three per-axis outer switches, which in turn
+    ring-connect to the same axis's outer switches on other interposers
+    (axis_id >= 1). _draw_ring's single-shared-circle layout only ever
+    positions one axis's switches from its primary loop, dumping every
+    inner switch (and every other axis's outer switches) at (0, 0) via its
+    "shouldn't happen" fallback -- which, here, happens for every one of
+    them, hence everything piling up at the center.
+
+    Drawn instead as one concentric circle per active axis (outer
+    switches only), plus an inner cluster of hub switches each placed
+    toward the mean direction of its own spokes' outer switches, at a
+    smaller radius than every axis circle -- so spokes read as short
+    inward lines instead of overlapping at the origin.
+    """
+    local_edges = [(u, v) for u, v, d in switch_graph.edges(data=True) if d.get("axis_id") == 0]
+    ring_graph = nx.Graph(
+        (u, v, d) for u, v, d in switch_graph.edges(data=True) if d.get("axis_id", 0) != 0
+    )
+
+    axis_groups = _axis_groups(ring_graph)
+    num_axes = len(axis_groups)
+    base_radius, ring_spacing = 3.0, 1.6
+
+    pos: dict[str, tuple[float, float]] = {}
+    angle: dict[str, float] = {}
+    for axis_idx, (name, components) in enumerate(axis_groups):
+        radius = base_radius + axis_idx * ring_spacing
+        axis_pos, axis_angle = _place_ring_components(components, radius)
+        pos.update(axis_pos)
+        angle.update(axis_angle)
+
+        color = _AXIS_COLORS[axis_idx % len(_AXIS_COLORS)]
+        for ring in components:
+            L = len(ring)
+            for i in range(L):
+                a, b = ring[i], ring[(i + 1) % L]
+                if L > 1 and ring_graph.has_edge(a, b):
+                    pa, pb = axis_pos[a], axis_pos[b]
+                    ax.plot([pa[0], pb[0]], [pa[1], pb[1]], color=color, linewidth=1.3, zorder=2)
+        example_bw = next(iter(ring_graph.edges(components[0], data=True)))[2].get("speed_Gbps") if components and components[0] else None
+        axis_label = name if name is not None else f"ring axis {axis_idx}"
+        size_bw = f" (size={len(components[0])}, {example_bw:g} Gbps)" if components and example_bw is not None else ""
+        ax.plot([], [], color=color, linewidth=1.3, label=f"{axis_label}{size_bw}")
+
+    # Inner (hub) switches: anything with a local spoke that wasn't already
+    # placed as an outer switch above. Positioned at the mean direction of
+    # its own spokes' (already-placed) outer switches, so a hub with spokes
+    # to e.g. both its DP and CP outer switch sits roughly "between" them.
+    inner_radius = max(base_radius - ring_spacing, 1.0)
+    local_graph = nx.Graph(local_edges)
+    for node in local_graph.nodes:
+        if node in pos:
+            continue
+        neighbors = [n for n in local_graph.neighbors(node) if n in pos]
+        if not neighbors:
+            continue
+        mean_x = sum(pos[n][0] for n in neighbors) / len(neighbors)
+        mean_y = sum(pos[n][1] for n in neighbors) / len(neighbors)
+        theta = math.atan2(mean_y, mean_x) if (mean_x, mean_y) != (0.0, 0.0) else 0.0
+        p = (inner_radius * math.cos(theta), inner_radius * math.sin(theta))
+        pos[node] = p
+        angle[node] = theta
+        for n in neighbors:
+            ax.plot([p[0], pos[n][0]], [p[1], pos[n][1]], color="#bbbbbb", linewidth=0.6, zorder=1)
+
+    for switch, p in pos.items():
+        ax.plot(*p, "s", color="#e69138", markersize=7, zorder=4)
+        ax.annotate(switch, p, fontsize=5, ha="center", va="center", xytext=(0, 7), textcoords="offset points")
+
+    _draw_hosts(ax, topo, pos, angle, host_radius=1.0)
+    if num_axes:
+        ax.legend(loc="upper right", fontsize=7)
+    ax.set_title(f"Two-level ring topology ({num_axes} axis/axes, {len(topo.switches)} switches, {len(topo.hosts)} hosts)")
+
+
 def _draw_flat(ax, topo: Topology) -> None:
     switches = topo.switches
     pos = {s: (3.0 * math.cos(2 * math.pi * i / max(len(switches), 1)), 3.0 * math.sin(2 * math.pi * i / max(len(switches), 1))) for i, s in enumerate(switches)}
@@ -289,8 +383,11 @@ def visualize_topology(topo: Topology, output_path: str | None = None, show: boo
     hub = _hub_switch(topo, switch_graph)
 
     fig, ax = plt.subplots(figsize=(9, 9))
+    has_local_spokes = any(d.get("axis_id") == 0 for _, _, d in switch_graph.edges(data=True))
     if hub is not None:
         _draw_two_tier(ax, topo, switch_graph, hub)
+    elif has_local_spokes:
+        _draw_two_level_ring(ax, topo, switch_graph)
     elif switch_graph.number_of_edges() > 0:
         _draw_ring(ax, topo, switch_graph)
     else:

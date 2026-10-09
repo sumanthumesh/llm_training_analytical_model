@@ -169,8 +169,18 @@ def generate_opt_edgelist(
     # earlier axis is inactive while a later one isn't (e.g. dp=1, cp>1,
     # pp>1 would otherwise point cp's block at pp's switches and pp's block
     # past the end of the allocated range).
-    active_axes = [name for name, size in (("pp", dp), ("cp", cp), ("dp", pp)) if size > 1]
+    active_axes = [name for name, size in (("pp", pp), ("cp", cp), ("dp", dp)) if size > 1]
+    print(active_axes)
     axis_block_start = {name: num_domains + i * num_domains for i, name in enumerate(active_axes)}
+
+    # Fixed by name, not by position in active_axes: visualize.py decodes
+    # this back into a human label via a fixed {1:"dp",2:"cp",3:"pp"} dict,
+    # which only stays correct if a given axis always gets the same id
+    # regardless of which other axes happen to be active in this run (the
+    # same "position-dependent assignment breaks when an axis is skipped"
+    # bug as axis_block_start above, just surfacing as a wrong legend label
+    # instead of a wrong switch id).
+    axis_id = {"dp": 1, "cp": 2, "pp": 3}
 
     def outer_switch(axis: str, domain: int) -> str:
         return f"s{axis_block_start[axis] + domain}"
@@ -243,7 +253,7 @@ def generate_opt_edgelist(
     # much of the inner switch's own port budget reaches this ring at all;
     # the physical link between two interposers' same-axis ports runs at
     # its own full rate once it's on the wire.
-    for idx,axis in enumerate(active_axes):
+    for axis in active_axes:
         print(f"Generating links for {axis} ring(s) (outer bandwidth ratio {axis_ratio[axis]})")
         for ring in axis_rings[axis]:
             print(f"  Generating links for ring {ring}")
@@ -252,7 +262,7 @@ def generate_opt_edgelist(
                 next_domain = ring[(i + 1) % len(ring)]
                 lines.append(
                     f"link {outer_switch(axis, domain)} {outer_switch(axis, next_domain)} "
-                    f"speed_Gbps {outer_bandwidth_gbps*axis_ratio[axis]} latency_ns {outer_latency_ns} axis_id {idx+1}"
+                    f"speed_Gbps {outer_bandwidth_gbps*axis_ratio[axis]} latency_ns {outer_latency_ns} axis_id {axis_id[axis]}"
                 )
         lines.append("\n")
 
