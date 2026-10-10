@@ -255,16 +255,16 @@ def pipeline_stage_from_layer_id(layer_id:int,num_layers:int) -> int:
 # def node_id_from_axes(d,c=0,p=0,t=0):
 def node_id_from_axes(dims):
     #All inputs are lists or arrays
+    d = dims[0]
     c = dims[1]
     p = dims[2]
     t = dims[3]
-    d = dims[0]
-    return d*PP*CP*TP + p*CP*TP + c*TP + t
+    return d*CP*PP*TP + c*PP*TP + p*TP + t
 
 def axes_from_node_id(node_id:int):
-    d = node_id // (PP*CP*TP)
-    p = (node_id % (PP*CP*TP)) // (CP*TP)
-    c = (node_id % (CP*TP)) // TP
+    d = node_id // (CP*PP*TP)
+    c = (node_id % (PP*CP*TP)) // (PP*TP)
+    p = (node_id % (CP*TP)) // (TP)
     t = node_id % TP
 
     return d,p,c,t
