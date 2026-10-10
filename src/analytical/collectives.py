@@ -14,7 +14,12 @@ one is actually free can only be known once the simulation is running.
 
 from __future__ import annotations
 
+import logging
+
 from analytical.topology import PathInfo, RoutingTable
+from typing import List, Tuple
+
+logger = logging.getLogger("collectives")
 
 HopCandidates = list[list[PathInfo]]
 
@@ -102,22 +107,38 @@ def precompute_node(
         # list gives the same cost, so [0] is as good as any other.
         return max(alpha_beta_time(c[0].latency_sec, c[0].bandwidth_gbps, chunk_bytes) for c in hop_candidates)
 
+    def print_hop_candidates(hop_candidates: HopCandidates) -> str:
+        return "\n".join(f"  {i}: {', '.join('[%s]' % str(p) for p in c)}" for i, c in enumerate(hop_candidates))
+
+    def algorithm_hops(hops:List[Tuple[str,str]])->str:
+        return ",".join(f"({a},{b})" for a,b in hops)
+
     if subtype in ("SEND", "RECV", "SEND_RECV"):
         if n != 2:
             raise ValueError(f"{subtype} node {node['id']} expects a 2-NPU comm_group, got {hosts}")
+        logger.debug("%s, %s, %s", subtype, node["id"], node["name"])
         hop_candidates = [routing_table[hosts[0], hosts[1]]]
         duration = step_time(hop_candidates, size_bytes)
+        logger.debug("Hop candidates:\n%s", print_hop_candidates(hop_candidates))
 
     elif subtype in ("ALL_GATHER", "REDUCE_SCATTER"):
+        logger.debug("%s, %s, %s", node["id"], subtype, node["name"])
         # Ring algorithm: N-1 steps, each moving a 1/N chunk to the next rank.
-        hop_candidates = [routing_table[a, b] for a, b in ring_hops(hosts)]
+        ring_paths = ring_hops(hosts)
+        hop_candidates = [routing_table[a, b] for a, b in ring_paths]
         duration = (n - 1) * step_time(hop_candidates, size_bytes / n)
+        logger.debug("Ring paths: %s", algorithm_hops(ring_paths))
+        logger.debug("Hop candidates:\n%s", print_hop_candidates(hop_candidates))
 
     elif subtype == "ALL_REDUCE":
+        logger.debug("%s, %s, %s", node["id"], subtype, node["name"])
         # Ring all-reduce = ring reduce-scatter followed by ring all-gather:
         # 2*(N-1) steps of the same chunk size.
-        hop_candidates = [routing_table[a, b] for a, b in ring_hops(hosts)]
+        ring_paths = ring_hops(hosts)
+        hop_candidates = [routing_table[a, b] for a, b in ring_paths]
         duration = 2 * (n - 1) * step_time(hop_candidates, size_bytes / n)
+        logger.debug("Ring paths: %s", algorithm_hops(ring_paths))
+        logger.debug("Hop candidates:\n%s", print_hop_candidates(hop_candidates))
 
     elif subtype == "ALL_TO_ALL":
         # Approximate as one concurrent round of direct pairwise sends, bounded

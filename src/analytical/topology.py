@@ -24,9 +24,12 @@ host-switch links.
 from __future__ import annotations
 
 import argparse
+import logging
 from dataclasses import dataclass, field
 
 import networkx as nx
+
+logger = logging.getLogger("topology")
 
 
 @dataclass
@@ -65,6 +68,9 @@ class PathInfo:
     links: frozenset[tuple[str, str]]
     latency_sec: float
     bandwidth_gbps: float
+
+    def __str__(self) -> str:
+        return ",".join(f"({l[0]},{l[1]})" for l in self.links)
 
 
 RoutingTable = dict[tuple[str, str], list["PathInfo"]]

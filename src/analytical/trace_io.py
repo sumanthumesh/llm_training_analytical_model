@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import networkx as nx
 
 from tracegen.compress import load_trace_json
+
+logger = logging.getLogger("trace_io")
 
 
 def load_trace(path: str) -> nx.DiGraph:

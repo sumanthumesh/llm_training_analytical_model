@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 
 import simpy
 
@@ -10,6 +11,8 @@ from analytical.trace_io import load_trace
 from typing import Dict,Set,List,Tuple
 import time
 from dataclasses import dataclass
+
+logger = logging.getLogger("analytical_model")
 
 class RuntimeRecord:
     def __init__(self):
@@ -23,9 +26,14 @@ class RuntimeRecord:
         assert name in self.timers.keys(), f"{name} not recorded"
         self.timers[name][1] = time.time()
 
-    def report(self):
+    def report(self)->str:
+        field_width = max(len(name) for name in self.timers.keys())
+        result = f"\n========Simulation Runtime========\n"
+        result += f"{'Phase':<{field_width}}: duration(s)\n"
         for phase,times in self.timers.items():
-            print(f"{phase}:{times[0]}-{times[1]},{times[1]-times[0]}s")
+            result += f"{phase:<{field_width}}: {times[1]-times[0]:.2f}\n"
+        result += f"\n==================================\n"
+        return result
 
 walltime_recorder = RuntimeRecord()
 
@@ -53,8 +61,9 @@ class LinkManager:
         self.env = env
         self.available = set(topo.graph.edges())
         self._changed = env.event()
+        self.logger = logging.getLogger("link_manager")
 
-    def acquire(self, hop_candidates: HopCandidates):
+    def acquire(self, hop_candidates: HopCandidates, label: str = ""):
         """Resolves each hop to one of its candidate paths and reserves the
         union, atomically, only once every hop has found a free one.
 
@@ -65,6 +74,10 @@ class LinkManager:
         physical link) and are still globally free. If any hop comes up
         empty, the whole attempt is discarded -- no partial reservation --
         and retried once links free up elsewhere.
+
+        `label` is only used for the debug message logged each time an
+        attempt fails and this has to block -- purely for diagnostics, no
+        effect on the reservation logic itself.
         """
         while True:
             chosen: set[tuple[str, str]] = set()
@@ -82,6 +95,10 @@ class LinkManager:
             else:
                 self.available -= chosen
                 return chosen
+            busy_links = set()
+            for path in candidates:
+                busy_links |= path.links - (self.available - chosen)
+            self.logger.debug("(t=%12.9f) %s failed to issue -- busy link(s): %s", self.env.now, label, sorted(busy_links))
             yield self._changed
 
     def release(self, links: set[tuple[str, str]]):
@@ -96,7 +113,7 @@ def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbos
     if deps:
         yield simpy.AllOf(env, [done_events[dep] for dep in deps])
 
-    links = yield from link_manager.acquire(node["hop_candidates"])
+    links = yield from link_manager.acquire(node["hop_candidates"], label="%s %s %s" % (node_id, node["subtype"], node["name"]))
     if track_overlap:
         node["start_time"] = env.now
     if verbose:
@@ -225,8 +242,6 @@ def simulate(
     env.run()
     walltime_recorder.end("simpy_simulation")
 
-    walltime_recorder.report()
-
     return env.now
 
 
@@ -240,7 +255,14 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node issue/complete logging.")
     parser.add_argument("--overlap", action="store_true", help="Track and report exposed-compute/exposed-comm/overlapped/idle time breakdown.")
     parser.add_argument("--perfetto-trace", type=str, default=None, help="Write a Perfetto/Chrome-trace-format JSON to this path (open at ui.perfetto.dev).")
+    parser.add_argument("--debug", type=str, default="", metavar="MODULE[,MODULE...]", help="Enable debug logging for one or more comma-separated modules (e.g. --debug collectives,model).")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.WARNING, format="%(name)s: %(message)s")
+    for module_name in args.debug.split(","):
+        module_name = module_name.strip()
+        if module_name:
+            logging.getLogger(module_name.lower()).setLevel(logging.DEBUG)
 
     print(f"Parsing Edgelist")
     walltime_recorder.start("parse_edgelist")
@@ -276,3 +298,6 @@ if __name__ == "__main__":
     if args.perfetto_trace:
         write_perfetto_trace(dag, args.perfetto_trace)
         print(f"Wrote Perfetto trace to {args.perfetto_trace}")
+
+    walltime_logger = logging.getLogger("walltime")
+    walltime_logger.debug("%s", walltime_recorder.report())    
