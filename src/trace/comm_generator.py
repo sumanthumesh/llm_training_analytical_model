@@ -47,6 +47,7 @@ def main():
     parser.add_argument("--size","-s",type=float,help="Size of the communication in GB")
     parser.add_argument("--output","-o",type=str,help="Output file path to save the generated communication node")
     parser.add_argument("--compressed",action="store_true",help="Write a plain .json trace instead of zstd-compressed .json.zst")
+    parser.add_argument("--single",action="store_true",help="Emit only rank 0's comm group instead of one per group across the whole topology.")
     args = parser.parse_args()
 
     global TP, PP, CP, DP
@@ -64,6 +65,8 @@ def main():
     }
 
     comm_group = get_comm_group(args.axis)
+    if args.single:
+        comm_group = comm_group[:1]  # first group returned always contains rank 0
     print(comm_group)
     for cg in comm_group:
         comm_node = make_comm_node(args.type,
