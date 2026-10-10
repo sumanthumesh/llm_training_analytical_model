@@ -1208,7 +1208,7 @@ def write_trace_to_json(nodes:List[Node], filepath:str, compressed:bool=True) ->
             "type": node.type,
             "subtype": node.subtype,
             "name": node.name,
-            "comm_group": [int(npu_id) for npu_id in node.comm_group],
+            "comm_group": [int(npu_id) for npu_id in sorted(node.comm_group)],
             "size": int(node.size),
             "deps": node.deps,
             "comps": [[matmul_to_json(matmul) for matmul in stage] for stage in node.comps],
