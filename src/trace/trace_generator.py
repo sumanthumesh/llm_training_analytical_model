@@ -210,14 +210,12 @@ class MatMul:
         return f"[{','.join(str(x) for x in self.inputA)}] x [{','.join(str(x) for x in self.inputB)}] -> [{','.join(str(x) for x in self.output)}]"
 
 sharding_formulas = {
-    "fwd_cp_all_gather_k" : M*S*H_k/tp*D_h,
-    "fwd_cp_all_gather_v" : M*S*H_k/tp*D_h,
+    "fwd_cp_all_gather_kv" : 2*M*S*H_k/tp*D_h,
     "fwd_tp_all_reduce_attn" : M*S/cp*D,
     "fwd_tp_all_reduce_ffn" : M*S/cp*D,
     "fwd_fsdp_all_gather" : per_layer_weight_sizes(),
     "bwd_tp_all_reduce_ffn" : M*S/cp*D,
-    "bwd_cp_reduce_scatter_k" : M*S*H_k/tp*D_h,
-    "bwd_cp_reduce_scatter_v" : M*S*H_k/tp*D_h,
+    "bwd_cp_reduce_scatter_kv" : 2*M*S*H_k/tp*D_h,
     "bwd_tp_all_reduce_attn" : M*S/cp*D,
     "bwd_fsdp_reduce_scatter" : per_layer_gradient_sizes(),
     "bwd_cp_all_reduce" : per_layer_gradient_sizes()/dp,
@@ -409,25 +407,18 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
     cp_all_gather_comm_groups = permute_axes(-1,-2,pipeline_stage_id,-1)
     cp_all_gather_nodes = []
     for comm_group in cp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_all_gather_comm_groups))]:
-        #All gather K across CP
-        all_gather_k = make_comm_node(
+        #All gather K and V across CP in one call -- same comm group, same
+        #shape (H_k, D_h) for both, so there's nothing distinguishing them as
+        #separate collectives.
+        all_gather_kv = make_comm_node(
             "ALL_GATHER",
-            f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.k",
+            f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.kv",
             comm_group,
-            RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_k"],
+            RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_kv"],
             [comp_kvq_projection_node.id],
             degree=CP
         )
-        all_gather_v = make_comm_node(
-            "ALL_GATHER",
-            f"mb{microbatch_id}.layer{layer_id}.fwd.cp_all_gather.v",
-            comm_group,
-            RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_v"],
-            [comp_kvq_projection_node.id],
-            degree=CP
-        )
-        cp_all_gather_nodes.append(all_gather_k)
-        cp_all_gather_nodes.append(all_gather_v)
+        cp_all_gather_nodes.append(all_gather_kv)
 
     cp_all_gather_sync_node = Node(
         "SYNC",
@@ -546,7 +537,7 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
         ]]
         recompute_ffn_node = make_comp_node(
             "MATMUL",
-            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_ffn",
+            f"mb{microbatch_id}.layer{layer_id}.recomp.recompute_ffn",
             [dep_id],
             recompute_ffn
         )
@@ -560,7 +551,7 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
         ]]
         recompute_kvq_node = make_comp_node(
             "MATMUL",
-            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_kvq_projection",
+            f"mb{microbatch_id}.layer{layer_id}.recomp.recompute_kvq_projection",
             [dep_id],
             recompute_kvq
         )
@@ -568,29 +559,20 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
         cp_all_gather_comm_groups = permute_axes(-1,-2,pipeline_stage_id,-1)
         recompute_cp_all_gather_nodes = []
         for comm_group in cp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_all_gather_comm_groups))]:
-            all_gather_k = make_comm_node(
+            all_gather_kv = make_comm_node(
                 "ALL_GATHER",
-                f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_cp_all_gather.k",
+                f"mb{microbatch_id}.layer{layer_id}.recomp.recompute_cp_all_gather.kv",
                 comm_group,
-                RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_k"],
+                RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_kv"],
                 [recompute_kvq_node.id],
                 degree=CP
             )
-            all_gather_v = make_comm_node(
-                "ALL_GATHER",
-                f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_cp_all_gather.v",
-                comm_group,
-                RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_v"],
-                [recompute_kvq_node.id],
-                degree=CP
-            )
-            recompute_cp_all_gather_nodes.append(all_gather_k)
-            recompute_cp_all_gather_nodes.append(all_gather_v)
+            recompute_cp_all_gather_nodes.append(all_gather_kv)
 
         recompute_cp_all_gather_sync_node = Node(
             "SYNC",
             "BARRIER",
-            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_post_cp_all_gather",
+            f"mb{microbatch_id}.layer{layer_id}.recomp.recompute_post_cp_all_gather",
             [],
             0,
             [node.id for node in recompute_cp_all_gather_nodes]
@@ -602,7 +584,7 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
         ]
         recompute_attn_node = make_comp_node(
             "MATMUL",
-            f"mb{microbatch_id}.layer{layer_id}.bwd.recompute_attn_score",
+            f"mb{microbatch_id}.layer{layer_id}.recomp.recompute_attn_score",
             [recompute_cp_all_gather_sync_node.id],
             recompute_score_attn
         )
@@ -710,7 +692,7 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     # Stage 2 (dS, dV_hat) both depend only on dA (from stage 1) -- parallel;
     # dW_oA doesn't feed either, it's a GradSync output. Stage 3 (dQ, dK_hat)
     # both depend only on dS (from stage 2) -- parallel; dV_hat doesn't feed
-    # either, it heads straight to cp_reduce_scatter.v.
+    # either, it heads straight to cp_reduce_scatter.kv.
     comp_attn_backward = [
         [
             MatMul("dAo@WoA",[M,S/cp,D],[H_q/tp,D_h,D],[D],[M,S/cp,H_q/tp,D_h]),
@@ -739,24 +721,15 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     cp_reduce_scatter_comm_groups = permute_axes(-1,-2,pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-1)
     cp_reduce_scatter_nodes = []
     for comm_group in cp_reduce_scatter_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(cp_reduce_scatter_comm_groups))]:
-        reduce_scatter_k = make_comm_node(
+        reduce_scatter_kv = make_comm_node(
             "REDUCE_SCATTER",
-            f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.k",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.kv",
             comm_group,
-            RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_k"],
+            RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_kv"],
             [comp_attn_backward_node.id],
             degree=CP
         )
-        reduce_scatter_v = make_comm_node(
-            "REDUCE_SCATTER",
-            f"mb{microbatch_id}.layer{layer_id}.bwd.cp_reduce_scatter.v",
-            comm_group,
-            RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_v"],
-            [comp_attn_backward_node.id],
-            degree=CP
-        )
-        cp_reduce_scatter_nodes.append(reduce_scatter_k)
-        cp_reduce_scatter_nodes.append(reduce_scatter_v)
+        cp_reduce_scatter_nodes.append(reduce_scatter_kv)
 
     cp_reduce_scatter_sync_node = Node(
         "SYNC",
