@@ -15,12 +15,7 @@ axis_pos = {
     "tp": 3
 }
 
-degree_size = {
-    "dp": DP,
-    "cp": CP,
-    "pp": PP,
-    "tp": TP
-}
+degree_size = {}
 
 def coords_to_rank(dp,cp,pp,tp):
     return dp * CP * PP * TP + cp * PP * TP + pp * TP + tp
@@ -59,6 +54,14 @@ def main():
     PP = args.parallelism[2]
     CP = args.parallelism[1]
     DP = args.parallelism[0]
+
+    global degree_size
+    degree_size = {
+        "dp": DP,
+        "cp": CP,
+        "pp": PP,
+        "tp": TP
+    }
 
     comm_group = get_comm_group(args.axis)
     print(comm_group)
