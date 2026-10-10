@@ -139,13 +139,21 @@ def build_routing_table(topo: Topology) -> RoutingTable:
 
 
 def _parse_kv_pairs(tokens: list[str]) -> dict:
-    """Parse trailing 'key value key value ...' tokens into a dict of floats."""
+    """Parse trailing 'key value key value ...' tokens into a dict, coercing
+    each value to float when it looks numeric (the common case -- speed,
+    latency, axis_id, ...) and keeping it as the original string otherwise
+    (e.g. gen_opt_topology.py's "direction bi"/"direction uni" tag) rather
+    than silently dropping it -- a non-numeric value used to vanish from the
+    result entirely with no error, which is exactly how "direction" went
+    unnoticed before parse_edgelist was taught to act on it.
+    """
     kv = {}
     for i in range(0, len(tokens) - 1, 2):
+        value = tokens[i + 1]
         try:
-            kv[tokens[i]] = float(tokens[i + 1])
+            kv[tokens[i]] = float(value)
         except ValueError:
-            continue
+            kv[tokens[i]] = value
     return kv
 
 
@@ -197,19 +205,33 @@ def parse_edgelist(path: str) -> Topology:
                 overrides = _parse_kv_pairs(tokens[3:])
                 speed_gbps = overrides.get("speed_Gbps", defaults["speed_Gbps"])
                 latency_ns = overrides.get("latency_ns", defaults["latency_ns"])
-                # Anything beyond speed_Gbps/latency_ns (e.g. gen_opt_topology.py's
-                # axis_id tag) is still a real per-link attribute -- pass it
-                # through to the edge instead of silently dropping it.
-                extra = {k: v for k, v in overrides.items() if k not in ("speed_Gbps", "latency_ns")}
+                # Defaults to "bi" for edgelists that don't specify it at all
+                # (every generator before gen_opt_topology.py's direction
+                # tag), preserving today's always-add-the-reverse behavior
+                # for those.
+                direction = overrides.get("direction", "bi")
+                if direction not in ("bi", "uni"):
+                    raise ValueError(f"Unrecognized link direction {direction!r} in line: {line!r}")
+                # Anything beyond speed_Gbps/latency_ns/direction (e.g.
+                # gen_opt_topology.py's axis_id tag) is still a real per-link
+                # attribute -- pass it through to the edge instead of
+                # silently dropping it.
+                extra = {k: v for k, v in overrides.items() if k not in ("speed_Gbps", "latency_ns", "direction")}
                 for node in (a, b):
                     if node not in graph:
                         node_type = "host" if node.startswith("h") else "switch"
                         graph.add_node(node, type=node_type)
-                # Two directed edges, not one undirected edge: each direction
-                # of a physical link is an independently reservable resource
-                # (see Topology's docstring).
-                graph.add_edge(a, b, speed_Gbps=speed_gbps, latency_ns=latency_ns, **extra)
-                graph.add_edge(b, a, speed_Gbps=speed_gbps, latency_ns=latency_ns, **extra)
+                # Two directed edges, not one undirected edge, for a "bi"
+                # link: each direction of a physical link is an
+                # independently reservable resource (see Topology's
+                # docstring). A "uni" link only ever gets the a->b edge --
+                # the reverse direction genuinely doesn't exist (e.g.
+                # gen_opt_topology.py's unidirectional ring links, see the
+                # bidirectional-ring spoke-contention discussion this
+                # convention exists to resolve).
+                graph.add_edge(a, b, speed_Gbps=speed_gbps, latency_ns=latency_ns, direction=direction, **extra)
+                if direction == "bi":
+                    graph.add_edge(b, a, speed_Gbps=speed_gbps, latency_ns=latency_ns, direction=direction, **extra)
             else:
                 raise ValueError(f"Unrecognized edgelist keyword: {keyword!r} in line: {line!r}")
 

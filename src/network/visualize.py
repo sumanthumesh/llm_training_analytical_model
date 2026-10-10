@@ -36,73 +36,25 @@ from analytical.topology import Topology, parse_edgelist
 
 _AXIS_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#8c564b"]
 
-DirectionMap = dict  # frozenset[str] -> (direction: str, head_a: str, head_b: str)
-
-
-def _parse_link_directions(edgelist_path: str) -> "DirectionMap":
-    """Scans the raw edgelist text for each 'link a b ... direction bi|uni
-    ...' line (gen_opt_topology.py's convention). Not available through
-    parse_edgelist/topo.graph: _parse_kv_pairs runs every value through
-    float(), so a non-numeric value like "bi"/"uni" is silently dropped
-    there -- this does its own independent pass over the file instead.
-
-    Returns {frozenset({a, b}): (direction, head_a, head_b)}, keyed so a
-    caller can look up by either order and still get the original a->b
-    direction for a "uni" arrow. A pair listed as "uni" in both directions
-    (the only way a 2-member ring is expressible without a reverse edge,
-    see gen_opt_topology.py's ring-of-2 case) is reported as "bi" instead,
-    since both directions are genuinely, physically present.
+def _draw_edge(ax, p_a: tuple[float, float], p_b: tuple[float, float], name_a: str, name_b: str, graph: nx.DiGraph, color="#333333", linewidth=1.2, zorder=2, linestyle="-") -> None:
+    """Draws the link between name_a (at p_a) and name_b (at p_b) as an
+    arrow reflecting which directed edges actually exist between them in
+    `graph` (topo.graph -- parse_edgelist already resolved "direction
+    bi"/"direction uni" into which of the two directed edges exist, so
+    there's no need to re-derive it from the raw edgelist text): both
+    directions present draws a double-headed arrow (true whether that came
+    from one "bi" line or two separate "uni" lines, e.g. gen_opt_topology.py's
+    ring-of-2 case -- both directions are genuinely present either way),
+    only one draws a single-headed arrow pointing that way, and neither
+    (shouldn't happen for a real edge) falls back to a plain line.
     """
-    bi_pairs: set[frozenset[str]] = set()
-    uni_tuples: dict[frozenset[str], set[tuple[str, str]]] = defaultdict(set)
-
-    with open(edgelist_path) as f:
-        for raw_line in f:
-            line = raw_line.split("#", 1)[0].strip()
-            tokens = line.split()
-            if len(tokens) < 3 or tokens[0] != "link":
-                continue
-            a, b = tokens[1], tokens[2]
-            if "direction" not in tokens[3:]:
-                continue
-            idx = tokens.index("direction", 3)
-            if idx + 1 >= len(tokens):
-                continue
-            direction = tokens[idx + 1]
-            key = frozenset({a, b})
-            if direction == "bi":
-                bi_pairs.add(key)
-            elif direction == "uni":
-                uni_tuples[key].add((a, b))
-
-    directions: DirectionMap = {}
-    for key in bi_pairs:
-        a, b = tuple(key) if len(key) == 2 else (next(iter(key)),) * 2
-        directions[key] = ("bi", a, b)
-    for key, tuples in uni_tuples.items():
-        if key in directions:
-            continue
-        a, b = next(iter(tuples))
-        directions[key] = ("bi", a, b) if len(tuples) >= 2 else ("uni", a, b)
-    return directions
-
-
-def _draw_edge(ax, p_a: tuple[float, float], p_b: tuple[float, float], name_a: str, name_b: str, directions: "DirectionMap", color="#333333", linewidth=1.2, zorder=2, linestyle="-") -> None:
-    """Draws the link between name_a (at p_a) and name_b (at p_b). If
-    `directions` (see _parse_link_directions) has an entry for this pair,
-    renders it as an arrow instead of a plain line: both ends for "bi",
-    one end -- pointing in the edgelist's original a->b order, regardless
-    of which order name_a/name_b were passed in -- for "uni". Falls back to
-    a plain line (today's behavior) when there's no entry at all, e.g. an
-    edgelist that doesn't carry gen_opt_topology.py's direction convention.
-    """
-    entry = directions.get(frozenset({name_a, name_b}))
-    if entry is None:
+    fwd = graph.has_edge(name_a, name_b)
+    rev = graph.has_edge(name_b, name_a)
+    if not fwd and not rev:
         ax.plot([p_a[0], p_b[0]], [p_a[1], p_b[1]], color=color, linewidth=linewidth, linestyle=linestyle, zorder=zorder)
         return
-    direction, head_a, _ = entry
-    start, end = (p_a, p_b) if head_a == name_a else (p_b, p_a)
-    arrowstyle = "<|-|>" if direction == "bi" else "-|>"
+    start, end = (p_a, p_b) if fwd else (p_b, p_a)
+    arrowstyle = "<|-|>" if (fwd and rev) else "-|>"
     ax.annotate(
         "", xy=end, xytext=start,
         arrowprops=dict(arrowstyle=arrowstyle, color=color, linewidth=linewidth, shrinkA=0, shrinkB=0),
@@ -228,7 +180,7 @@ def _fan_positions(center: tuple[float, float], anchor_angle: float, count: int,
     return [(cx + radius * math.cos(a), cy + radius * math.sin(a)) for a in angles]
 
 
-def _draw_hosts(ax, topo: Topology, anchor_pos: dict[str, tuple[float, float]], anchor_angle: dict[str, float], host_radius: float, directions: "DirectionMap" = {}) -> dict[str, tuple[float, float]]:
+def _draw_hosts(ax, topo: Topology, anchor_pos: dict[str, tuple[float, float]], anchor_angle: dict[str, float], host_radius: float) -> dict[str, tuple[float, float]]:
     hosts_by_switch: dict[str, list[str]] = defaultdict(list)
     switches = set(topo.switches)
     for host in topo.hosts:
@@ -247,12 +199,12 @@ def _draw_hosts(ax, topo: Topology, anchor_pos: dict[str, tuple[float, float]], 
         for host, pos in zip(hosts, positions):
             host_positions[host] = pos
             ax.plot(*pos, "o", color="#6fa8dc", markersize=5, zorder=3)
-            _draw_edge(ax, anchor_pos[switch], pos, switch, host, directions, color="#999999", linewidth=0.5, zorder=1)
+            _draw_edge(ax, anchor_pos[switch], pos, switch, host, topo.graph, color="#999999", linewidth=0.5, zorder=1)
             ax.annotate(host, pos, fontsize=5, ha="center", va="center", xytext=(0, 6), textcoords="offset points")
     return host_positions
 
 
-def _draw_two_tier(ax, topo: Topology, switch_graph: nx.Graph, hub: str, directions: "DirectionMap" = {}) -> None:
+def _draw_two_tier(ax, topo: Topology, switch_graph: nx.Graph, hub: str) -> None:
     leaves = [s for s in topo.switches if s != hub]
     ax.plot(0, 0, "s", color="#e06666", markersize=14, zorder=4)
     ax.annotate(hub, (0, 0), fontsize=7, ha="center", va="center", xytext=(0, -14), textcoords="offset points")
@@ -269,16 +221,16 @@ def _draw_two_tier(ax, topo: Topology, switch_graph: nx.Graph, hub: str, directi
         ax.plot(*p, "s", color="#e69138", markersize=10, zorder=4)
         ax.annotate(leaf, p, fontsize=6, ha="center", va="center", xytext=(0, -10), textcoords="offset points")
         if switch_graph.has_edge(hub, leaf):
-            _draw_edge(ax, (0.0, 0.0), p, hub, leaf, directions, color="#333333", linewidth=1.2, zorder=2)
+            _draw_edge(ax, (0.0, 0.0), p, hub, leaf, topo.graph, color="#333333", linewidth=1.2, zorder=2)
 
-    host_positions = _draw_hosts(ax, topo, pos, angle, host_radius=1.4, directions=directions)
+    host_positions = _draw_hosts(ax, topo, pos, angle, host_radius=1.4)
 
     # dgx's bypass links (host -> hub directly, skipping the leaf switch)
     # drawn faint so the "two tiers, but hosts also reach the spine
     # directly" shape reads clearly without overwhelming the leaf fans.
     for host, hp in host_positions.items():
         if topo.graph.has_edge(host, hub):
-            _draw_edge(ax, hp, (0.0, 0.0), host, hub, directions, color="#cccccc", linewidth=0.4, linestyle="--", zorder=0)
+            _draw_edge(ax, hp, (0.0, 0.0), host, hub, topo.graph, color="#cccccc", linewidth=0.4, linestyle="--", zorder=0)
     ax.set_title(f"Two-tier topology (hub: {hub}, {len(leaves)} leaf switch(es), {len(topo.hosts)} hosts)")
 
 
@@ -305,7 +257,7 @@ def _place_ring_components(components: list[list[str]], radius: float) -> tuple[
     return pos, angle
 
 
-def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph, directions: "DirectionMap" = {}) -> None:
+def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph) -> None:
     """Every switch sits at exactly one position, placed around a single
     shared circle by the axis with the biggest ring (fewest, largest
     loops) -- so that axis reads as an actual circle. The other axes'
@@ -345,7 +297,7 @@ def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph, directions: "Directio
             for i in range(L):
                 a, b = ring[i], ring[(i + 1) % L]
                 if L > 1 and switch_graph.has_edge(a, b):
-                    _draw_edge(ax, pos[a], pos[b], a, b, directions, color=color, linewidth=1.3, zorder=2)
+                    _draw_edge(ax, pos[a], pos[b], a, b, topo.graph, color=color, linewidth=1.3, zorder=2)
         example_bw = next(iter(switch_graph.edges(components[0], data=True)))[2]["speed_Gbps"] if components and components[0] else None
         axis_label = name if name is not None else f"ring axis {axis_idx}"
         size_bw = f" (size={len(components[0])}, {example_bw:g} Gbps)" if components and example_bw is not None else ""
@@ -355,13 +307,13 @@ def _draw_ring(ax, topo: Topology, switch_graph: nx.Graph, directions: "Directio
         ax.plot(*p, "s", color="#e69138", markersize=7, zorder=4)
         ax.annotate(switch, p, fontsize=5, ha="center", va="center", xytext=(0, 7), textcoords="offset points")
 
-    _draw_hosts(ax, topo, pos, angle, host_radius=1.4, directions=directions)
+    _draw_hosts(ax, topo, pos, angle, host_radius=1.4)
     if num_axes:
         ax.legend(loc="upper right", fontsize=7)
     ax.set_title(f"Ring topology ({num_axes} axis/axes, {len(topo.switches)} interposer(s), {len(topo.hosts)} hosts)")
 
 
-def _draw_two_level_ring(ax, topo: Topology, switch_graph: nx.Graph, directions: "DirectionMap" = {}) -> None:
+def _draw_two_level_ring(ax, topo: Topology, switch_graph: nx.Graph) -> None:
     """gen_opt_topology.py's inner-hub design: each interposer's inner
     switch carries no ring edges of its own, only a "local" spoke
     (axis_id 0) to up to three per-axis outer switches, which in turn
@@ -401,7 +353,7 @@ def _draw_two_level_ring(ax, topo: Topology, switch_graph: nx.Graph, directions:
             for i in range(L):
                 a, b = ring[i], ring[(i + 1) % L]
                 if L > 1 and ring_graph.has_edge(a, b):
-                    _draw_edge(ax, axis_pos[a], axis_pos[b], a, b, directions, color=color, linewidth=1.3, zorder=2)
+                    _draw_edge(ax, axis_pos[a], axis_pos[b], a, b, topo.graph, color=color, linewidth=1.3, zorder=2)
         example_bw = next(iter(ring_graph.edges(components[0], data=True)))[2].get("speed_Gbps") if components and components[0] else None
         axis_label = name if name is not None else f"ring axis {axis_idx}"
         size_bw = f" (size={len(components[0])}, {example_bw:g} Gbps)" if components and example_bw is not None else ""
@@ -426,50 +378,43 @@ def _draw_two_level_ring(ax, topo: Topology, switch_graph: nx.Graph, directions:
         pos[node] = p
         angle[node] = theta
         for n in neighbors:
-            _draw_edge(ax, p, pos[n], node, n, directions, color="#bbbbbb", linewidth=0.6, zorder=1)
+            _draw_edge(ax, p, pos[n], node, n, topo.graph, color="#bbbbbb", linewidth=0.6, zorder=1)
 
     for switch, p in pos.items():
         ax.plot(*p, "s", color="#e69138", markersize=7, zorder=4)
         ax.annotate(switch, p, fontsize=5, ha="center", va="center", xytext=(0, 7), textcoords="offset points")
 
-    _draw_hosts(ax, topo, pos, angle, host_radius=1.0, directions=directions)
+    _draw_hosts(ax, topo, pos, angle, host_radius=1.0)
     if num_axes:
         ax.legend(loc="upper right", fontsize=7)
     ax.set_title(f"Two-level ring topology ({num_axes} axis/axes, {len(topo.switches)} switches, {len(topo.hosts)} hosts)")
 
 
-def _draw_flat(ax, topo: Topology, directions: "DirectionMap" = {}) -> None:
+def _draw_flat(ax, topo: Topology) -> None:
     switches = topo.switches
     pos = {s: (3.0 * math.cos(2 * math.pi * i / max(len(switches), 1)), 3.0 * math.sin(2 * math.pi * i / max(len(switches), 1))) for i, s in enumerate(switches)}
     angle = {s: 2 * math.pi * i / max(len(switches), 1) for i, s in enumerate(switches)}
     for s, p in pos.items():
         ax.plot(*p, "s", color="#e69138", markersize=10, zorder=4)
         ax.annotate(s, p, fontsize=6, ha="center", va="center", xytext=(0, -10), textcoords="offset points")
-    _draw_hosts(ax, topo, pos, angle, host_radius=1.4, directions=directions)
+    _draw_hosts(ax, topo, pos, angle, host_radius=1.4)
     ax.set_title(f"Flat topology ({len(switches)} switch(es), {len(topo.hosts)} hosts)")
 
 
-def visualize_topology(topo: Topology, output_path: str | None = None, show: bool = False, directions: "DirectionMap" = {}) -> None:
-    """directions (see _parse_link_directions) is optional: a Topology alone
-    carries no per-link bi/uni info (parse_edgelist doesn't preserve it --
-    see _parse_link_directions's docstring), so a caller without the
-    original edgelist path (or an edgelist that doesn't use
-    gen_opt_topology.py's "direction bi|uni" convention) just gets today's
-    plain lines, unchanged.
-    """
+def visualize_topology(topo: Topology, output_path: str | None = None, show: bool = False) -> None:
     switch_graph = _switch_graph(topo)
     hub = _hub_switch(topo, switch_graph)
 
     fig, ax = plt.subplots(figsize=(9, 9))
     has_local_spokes = any(d.get("axis_id") == 0 for _, _, d in switch_graph.edges(data=True))
     if hub is not None:
-        _draw_two_tier(ax, topo, switch_graph, hub, directions=directions)
+        _draw_two_tier(ax, topo, switch_graph, hub)
     elif has_local_spokes:
-        _draw_two_level_ring(ax, topo, switch_graph, directions=directions)
+        _draw_two_level_ring(ax, topo, switch_graph)
     elif switch_graph.number_of_edges() > 0:
-        _draw_ring(ax, topo, switch_graph, directions=directions)
+        _draw_ring(ax, topo, switch_graph)
     else:
-        _draw_flat(ax, topo, directions=directions)
+        _draw_flat(ax, topo)
 
     ax.set_aspect("equal")
     ax.axis("off")
@@ -487,12 +432,7 @@ def visualize_edgelist_file(edgelist_path: str, output_path: str | None = None, 
     """Convenience wrapper for callers that only have an edgelist path on
     disk (e.g. the gen_*_topology.py scripts' --visualize option) rather
     than an already-parsed Topology."""
-    visualize_topology(
-        parse_edgelist(edgelist_path),
-        output_path=output_path,
-        show=show,
-        directions=_parse_link_directions(edgelist_path),
-    )
+    visualize_topology(parse_edgelist(edgelist_path), output_path=output_path, show=show)
 
 
 def main():
@@ -503,7 +443,7 @@ def main():
     args = parser.parse_args()
 
     topo = parse_edgelist(args.edgelist)
-    visualize_topology(topo, output_path=args.plot, show=args.show, directions=_parse_link_directions(args.edgelist))
+    visualize_topology(topo, output_path=args.plot, show=args.show)
 
 
 if __name__ == "__main__":
