@@ -1195,7 +1195,7 @@ def write_trace_to_json(nodes:List[Node], filepath:str, compressed:bool=True) ->
     #(tens of GB for this project's larger configs) is never written to disk
     #at all. See compress.py's module docstring for the json.dumps()-vs-
     #json.dump() and compression-level reasoning; run compress.py directly
-    #(`python src/trace/compress.py decompress ...`) to materialize a plain
+    #(`python src/tracegen/compress.py decompress ...`) to materialize a plain
     #.json for manual inspection, or pass compressed=False here to skip
     #compression entirely (e.g. for a small trace you want to read directly).
     if compressed:

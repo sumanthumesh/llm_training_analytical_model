@@ -8,10 +8,11 @@ version = "0.1.0"
 description = "Analytical model for evaluating network topology and parallelism configurations for LLM training."
 requires-python = ">=3.10"
 
-# Package names are independent of their on-disk directory names (mapped via
-# package-dir below) so that `src/trace` -- which would otherwise shadow the
-# stdlib `trace` module if imported as `import trace` -- is importable as
-# `tracegen` instead.
+# The trace package lives on disk as src/tracegen (not src/trace) so that
+# `import tracegen` can't be confused with -- or shadow -- the stdlib `trace`
+# module; this also lets Pylance/Pyright resolve it by plain directory-name
+# matching, the same way it already does for analytical/network, instead of
+# needing to understand setuptools' package-dir remapping.
 [tool.setuptools]
-package-dir = { analytical = "src/analytical", network = "src/network", tracegen = "src/trace" }
+package-dir = { "" = "src" }
 packages = ["analytical", "network", "tracegen"]
