@@ -76,6 +76,33 @@ class PathInfo:
 RoutingTable = dict[tuple[str, str], list["PathInfo"]]
 
 
+def reverse_path(graph: nx.DiGraph, path: PathInfo) -> PathInfo | None:
+    """Returns path's exact mirror -- same physical hops, opposite direction
+    -- if every one of them has a real reverse edge in the graph, else None.
+
+    This is the check for whether a ring collective can run a second,
+    opposite-direction ring concurrently with the first: that's only possible
+    if every link the (forward) path crosses is "bi", not "uni" (see
+    topology.py's module docstring and gen_opt_topology.py's direction tag --
+    e.g. a TP ring within one interposer is all-bi and mirrors cleanly, while
+    a DP/CP/PP ring's outer-outer hop is uni and doesn't). Checked against the
+    raw graph rather than routing_table[dst, src], since a uni-only ring hop
+    may still have *some* route back to src -- the long way around the ring
+    -- which is a real path but not this path's mirror, and using it here
+    would wrongly charge the collective for a much more expensive "second
+    ring" instead of correctly reporting that one doesn't exist.
+    """
+    reversed_links = []
+    for u, v in path.links:
+        if not graph.has_edge(v, u):
+            return None
+        reversed_links.append((v, u))
+    reversed_links = frozenset(reversed_links)
+    latency_sec = sum(graph.edges[v, u]["latency_ns"] for v, u in reversed_links) * 1e-9
+    bandwidth_gbps = min(graph.edges[v, u]["speed_Gbps"] for v, u in reversed_links)
+    return PathInfo(reversed_links, latency_sec, bandwidth_gbps)
+
+
 def build_routing_table(topo: Topology) -> RoutingTable:
     """All-pairs routing table over hosts only (switches are pass-through hops,
     never a (src, dst) themselves).

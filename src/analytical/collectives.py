@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import logging
 
-from analytical.topology import PathInfo, RoutingTable
+import networkx as nx
+
+from analytical.topology import PathInfo, RoutingTable, reverse_path
 from typing import List, Tuple
 
 logger = logging.getLogger("collectives")
@@ -31,6 +33,56 @@ def alpha_beta_time(latency_sec: float, bandwidth_gbps: float, size_bytes: float
 
 def ring_hops(members: list[str]) -> list[tuple[str, str]]:
     return list(zip(members, members[1:] + members[:1]))
+
+
+def bidirectional_hop_candidates(graph: nx.DiGraph, hop_candidates: HopCandidates) -> HopCandidates | None:
+    """If every hop of a ring can also run in reverse, AND doing so for all
+    of them at once doesn't reuse any link the forward ring itself already
+    needs, returns the combined forward+reverse hop list -- letting the ring
+    split its data across both directions at once, on genuinely disjoint
+    links. Returns None otherwise, so the caller falls back to a
+    single-direction ring.
+
+    The second condition is the one that actually matters, and is easy to
+    get wrong: a hop's mirror can exist (reverse_path succeeds -- every link
+    it crosses is "bi", not "uni") while still being unusable, because a ring
+    routed through a shared switch (e.g. a TP ring within one interposer, or
+    any axis in gen_dgx_topology.py's spine-based design) already has its
+    forward-only hops using BOTH directions of every spoke between them: hop
+    i's path uses member_i's outgoing spoke and member_{i+1}'s incoming one,
+    and as i ranges over the whole ring, every member contributes both
+    directions of its own spoke to the FORWARD ring alone. The "reverse" ring
+    would then just retrace those same directed edges the other way around
+    the cycle, not open up new ones -- so instead of two independent rings
+    sharing the work, you'd get one ring plus a second copy of it demanding
+    links the first one is already holding, which can never be satisfied
+    (LinkManager.acquire would block forever). Checking the actual link
+    overlap (rather than reasoning about topology shape, hub vs. true ring)
+    catches this generally, including for whichever specific candidate
+    build_routing_table picked. Only candidate [0] of each hop is used here
+    -- the same representative-candidate simplification step_time already
+    relies on -- so this is a necessary, not perfect-information, check.
+
+    Skipped outright for a 2-member ring (n == 2): ring_hops already lists
+    both directions of that single pair as its two forward hops -- there's
+    no second, disjoint ring to add, just the same pair's two directions
+    double-counted.
+    """
+    if len(hop_candidates) <= 2:
+        return None
+    forward_links: set[tuple[str, str]] = set()
+    reverse_hops = []
+    reverse_links: set[tuple[str, str]] = set()
+    for candidates in hop_candidates:
+        forward_links |= candidates[0].links
+        mirrored = reverse_path(graph, candidates[0])
+        if mirrored is None:
+            return None
+        reverse_hops.append([mirrored])
+        reverse_links |= mirrored.links
+    if forward_links & reverse_links:
+        return None
+    return hop_candidates + reverse_hops
 
 
 def roofline_time(flops: float, tensor_size_bytes: float, peak_perf_tflops: float, local_mem_bw_gbps: float) -> float:
@@ -58,6 +110,7 @@ def compute_time(matmuls: list[dict], peak_perf_tflops: float, local_mem_bw_gbps
 def precompute_node(
     node: dict,
     routing_table: RoutingTable,
+    graph: nx.DiGraph,
     peak_perf_tflops: float,
     local_mem_bw_gbps: float,
     fixed_overhead_sec: float = 0.0,
@@ -88,6 +141,12 @@ def precompute_node(
     out a per-step explanation and points to a fixed per-invocation cost
     instead. It isn't a network resource, so it doesn't touch LinkManager /
     hop_candidates -- just a flat addition to duration.
+
+    graph is the physical topology's DiGraph, needed only to check (via
+    bidirectional_hop_candidates/reverse_path) whether a ring collective's
+    hops can also run in reverse -- i.e. whether every link involved is
+    "bi", not "uni" -- letting it split its data across two opposite-
+    direction rings at once instead of just one.
     """
     if node["type"] in ("SYNC", "DUMMY"):
         return [], 0.0
@@ -124,19 +183,33 @@ def precompute_node(
     elif subtype in ("ALL_GATHER", "REDUCE_SCATTER"):
         logger.debug("%s, %s, %s", node["id"], subtype, node["name"])
         # Ring algorithm: N-1 steps, each moving a 1/N chunk to the next rank.
+        # If every hop can also run in reverse (all its links are bi, not
+        # uni), run two opposite-direction rings at once instead, each
+        # carrying half the chunk -- same N-1 steps, half the bytes per step.
         ring_paths = ring_hops(hosts)
         hop_candidates = [routing_table[a, b] for a, b in ring_paths]
-        duration = (n - 1) * step_time(hop_candidates, size_bytes / n)
+        bidir_candidates = bidirectional_hop_candidates(graph, hop_candidates)
+        if bidir_candidates is not None:
+            hop_candidates = bidir_candidates
+            duration = (n - 1) * step_time(hop_candidates, size_bytes / n / 2)
+        else:
+            duration = (n - 1) * step_time(hop_candidates, size_bytes / n)
         logger.debug("Ring paths: %s", algorithm_hops(ring_paths))
         logger.debug("Hop candidates:\n%s", print_hop_candidates(hop_candidates))
 
     elif subtype == "ALL_REDUCE":
         logger.debug("%s, %s, %s", node["id"], subtype, node["name"])
         # Ring all-reduce = ring reduce-scatter followed by ring all-gather:
-        # 2*(N-1) steps of the same chunk size.
+        # 2*(N-1) steps of the same chunk size. Same bidirectional-ring
+        # halving as above when every hop's links are bi.
         ring_paths = ring_hops(hosts)
         hop_candidates = [routing_table[a, b] for a, b in ring_paths]
-        duration = 2 * (n - 1) * step_time(hop_candidates, size_bytes / n)
+        bidir_candidates = bidirectional_hop_candidates(graph, hop_candidates)
+        if bidir_candidates is not None:
+            hop_candidates = bidir_candidates
+            duration = 2 * (n - 1) * step_time(hop_candidates, size_bytes / n / 2)
+        else:
+            duration = 2 * (n - 1) * step_time(hop_candidates, size_bytes / n)
         logger.debug("Ring paths: %s", algorithm_hops(ring_paths))
         logger.debug("Hop candidates:\n%s", print_hop_candidates(hop_candidates))
 
