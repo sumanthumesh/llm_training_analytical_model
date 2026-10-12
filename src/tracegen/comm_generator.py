@@ -1,6 +1,7 @@
 import os
 from tracegen.trace_generator import make_comm_node, Node, write_trace_to_json
 from tracegen import compress
+import coords
 import argparse
 
 TP = 0
@@ -8,24 +9,19 @@ PP = 0
 CP = 0
 DP = 0
 
-axis_pos = {
-    "dp": 0,
-    "cp": 1,
-    "pp": 2,
-    "tp": 3
-}
+AXIS_ORDER = coords.DEFAULT_AXIS_ORDER
 
 degree_size = {}
 
+def _sizes():
+    return {"dp": DP, "cp": CP, "pp": PP, "tp": TP}
+
 def coords_to_rank(dp,cp,pp,tp):
-    return dp * CP * PP * TP + cp * PP * TP + pp * TP + tp
+    return coords.coords_to_rank({"dp": dp, "cp": cp, "pp": pp, "tp": tp}, _sizes(), AXIS_ORDER)
 
 def rank_to_coords(rank):
-    dp = rank // (CP * PP * TP)
-    cp = (rank % (CP * PP * TP)) // (PP * TP)
-    pp = (rank % (PP * TP)) // TP
-    tp = rank % TP
-    return dp, cp, pp, tp
+    c = coords.rank_to_coords(rank, _sizes(), AXIS_ORDER)
+    return c["dp"], c["cp"], c["pp"], c["tp"]
 
 def get_comm_group(axis:str):
     if axis == "dp":
@@ -42,6 +38,14 @@ def get_comm_group(axis:str):
 def main():
     parser = argparse.ArgumentParser(description="Generate communication nodes to run on analytical model.")
     parser.add_argument("--parallelism","-p",nargs=4,type=int,help="Parallelism config of the network in the order (dp,cp,pp,tp)")
+    parser.add_argument(
+        "--axis-order",
+        type=coords.axis_order_arg,
+        default=coords.DEFAULT_AXIS_ORDER,
+        help="Outermost-to-innermost nesting of dp,cp,pp,tp into one global NPU rank, comma-separated "
+             f"(default: {','.join(coords.DEFAULT_AXIS_ORDER)}). Must match whatever order trace_generator.py "
+             "and the topology were generated with."
+    )
     parser.add_argument("--type","-t",type=str,choices=["ALL_GATHER","ALL_REDUCE","REDUCE_SCATTER"],help="Type of communication node to generate")
     parser.add_argument("--axis","-a",type=str,choices=["dp","cp","pp","tp"],help="Axis of the communication node to generate")
     parser.add_argument("--size","-s",type=float,help="Size of the communication in GB")
@@ -50,11 +54,12 @@ def main():
     parser.add_argument("--single",action="store_true",help="Emit only rank 0's comm group instead of one per group across the whole topology.")
     args = parser.parse_args()
 
-    global TP, PP, CP, DP
+    global TP, PP, CP, DP, AXIS_ORDER
     TP = args.parallelism[3]
     PP = args.parallelism[2]
     CP = args.parallelism[1]
     DP = args.parallelism[0]
+    AXIS_ORDER = args.axis_order
 
     global degree_size
     degree_size = {
@@ -80,7 +85,7 @@ def main():
         output_path = args.output if compress.is_compressed(args.output) else args.output + compress.COMPRESSED_SUFFIX
     else:
         output_path = args.output
-    write_trace_to_json(list(Node._all_nodes.values()), output_path, compressed=args.compressed)
+    write_trace_to_json(list(Node._all_nodes.values()), output_path, compressed=args.compressed, axis_order=AXIS_ORDER)
 
 if __name__ == "__main__":
     main()

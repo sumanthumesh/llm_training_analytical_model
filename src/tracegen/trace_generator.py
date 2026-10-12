@@ -13,6 +13,7 @@ import enum
 
 from tracegen import mem_footprint
 from tracegen import compress
+import coords
 
 L = sympy.symbols("L")
 H_k = sympy.symbols("H_k")
@@ -69,6 +70,13 @@ REUSE_FWD_FSDP = False
 #from --recompute-activations; False (the flag's own default) means
 #activations stay resident and no recompute nodes get added.
 RECOMPUTE_ACTIVATIONS = False
+#Outermost-to-innermost nesting of the 4 parallelism axes into one global
+#NPU rank -- overridden from --axis-order. AXIS_STRIDES (set by
+#resolve_constants from this) is what node_id_from_axes actually uses; this
+#must match whatever axis order the topology (gen_dgx_topology.py /
+#gen_opt_topology.py) was generated with, or comm_group ids will reference
+#the wrong physical NPUs. See coords/__init__.py.
+AXIS_ORDER = coords.DEFAULT_AXIS_ORDER
 
 @dataclass
 class Node:
@@ -233,7 +241,7 @@ def resolve_constants():
     run) is what keeps generation fast. See git history if you need the
     reasoning spelled out further.
     """
-    global DP, PP, CP, TP, NUM_LAYERS, GLOBAL_BATCH_SIZE, MICROBATCH_SIZE, NUM_MICROBATCHES, RESOLVED_SHARDING_FORMULAS
+    global DP, PP, CP, TP, NUM_LAYERS, GLOBAL_BATCH_SIZE, MICROBATCH_SIZE, NUM_MICROBATCHES, RESOLVED_SHARDING_FORMULAS, AXIS_STRIDES
     DP = int(dp.subs(SUBSTITUTE_VALUES))
     PP = int(pp.subs(SUBSTITUTE_VALUES))
     CP = int(cp.subs(SUBSTITUTE_VALUES))
@@ -243,6 +251,12 @@ def resolve_constants():
     MICROBATCH_SIZE = int(M.subs(SUBSTITUTE_VALUES))
     NUM_MICROBATCHES = GLOBAL_BATCH_SIZE // (MICROBATCH_SIZE * DP)
     RESOLVED_SHARDING_FORMULAS = {key: formula.subs(SUBSTITUTE_VALUES) * BYTES_PER_ELEMENT for key, formula in sharding_formulas.items()}
+    #Per-axis stride in fixed (dp,cp,pp,tp) positional order -- node_id_from_axes
+    #always receives/returns coords in that fixed position order regardless of
+    #AXIS_ORDER; this is the only place AXIS_ORDER actually changes anything,
+    #by controlling which position gets the biggest stride.
+    _strides = coords.strides({"dp": DP, "cp": CP, "pp": PP, "tp": TP}, AXIS_ORDER)
+    AXIS_STRIDES = (_strides["dp"], _strides["cp"], _strides["pp"], _strides["tp"])
 
 
 
@@ -252,20 +266,20 @@ def pipeline_stage_from_layer_id(layer_id:int,num_layers:int) -> int:
 
 # def node_id_from_axes(d,c=0,p=0,t=0):
 def node_id_from_axes(dims):
-    #All inputs are lists or arrays
+    #All inputs are lists or arrays, always in fixed (dp,cp,pp,tp) positional
+    #order regardless of --axis-order -- AXIS_STRIDES (set by
+    #resolve_constants from AXIS_ORDER) is what actually determines how these
+    #combine into one global id, so every caller keeps using this same fixed
+    #calling convention no matter what order is configured.
     d = dims[0]
     c = dims[1]
     p = dims[2]
     t = dims[3]
-    return d*CP*PP*TP + c*PP*TP + p*TP + t
+    return int(d*AXIS_STRIDES[0] + c*AXIS_STRIDES[1] + p*AXIS_STRIDES[2] + t*AXIS_STRIDES[3])
 
 def axes_from_node_id(node_id:int):
-    d = node_id // (CP*PP*TP)
-    c = (node_id % (PP*CP*TP)) // (PP*TP)
-    p = (node_id % (CP*TP)) // (TP)
-    t = node_id % TP
-
-    return d,p,c,t
+    c = coords.rank_to_coords(node_id, {"dp": DP, "cp": CP, "pp": PP, "tp": TP}, AXIS_ORDER)
+    return c["dp"], c["cp"], c["pp"], c["tp"]
 
 def get_pp_transfer_comm_groups(from_stage:int,to_stage:int):
     comm_group_coords = []
@@ -1172,7 +1186,7 @@ def matmul_to_json(matmul:MatMul) -> Dict:
         "tensor_size_numeric": matmul.tensor_size_numeric,
     }
 
-def write_trace_to_json(nodes:List[Node], filepath:str, compressed:bool=True) -> None:
+def write_trace_to_json(nodes:List[Node], filepath:str, compressed:bool=True, axis_order:Tuple[str,...]=None) -> None:
     #Ignoring comm group deduplication (CommGroupTracker) for now — comm_group is written
     #as the literal list of involved NPU ids per node, for visual inspection.
     trace = [
@@ -1188,8 +1202,14 @@ def write_trace_to_json(nodes:List[Node], filepath:str, compressed:bool=True) ->
         }
         for node in sorted(nodes, key=lambda n: n.id)
     ]
+    #axis_order is provenance, not consumed by anything downstream of this
+    #trace's own node ids (those already have it baked in) -- it's here so
+    #analytical_model.py can cross-check it against the topology edgelist's
+    #own Axis_order line and refuse to simulate a mismatched pair, instead of
+    #silently producing a physically meaningless result.
     json_obj = {
         "nodes": trace,
+        "axis_order": list(axis_order if axis_order is not None else AXIS_ORDER),
     }
     #Writes zstd-compressed directly by default -- the uncompressed form
     #(tens of GB for this project's larger configs) is never written to disk
@@ -1288,6 +1308,14 @@ if __name__ == '__main__':
     parser.add_argument("--cp",type=int,default=1,help="Sequence parallelism degree")
     parser.add_argument("--pp",type=int,default=4,help="Pipeline parallelism degree")
     parser.add_argument("--tp",type=int,default=8,help="Tensor parallelism degree")
+    parser.add_argument(
+        "--axis-order",
+        type=coords.axis_order_arg,
+        default=coords.DEFAULT_AXIS_ORDER,
+        help="Outermost-to-innermost nesting of dp,cp,pp,tp into one global NPU rank, comma-separated "
+             f"(default: {','.join(coords.DEFAULT_AXIS_ORDER)}). Must match whatever order the topology "
+             "(gen_dgx_topology.py / gen_opt_topology.py) was generated with."
+    )
     parser.add_argument("--output","-o",type=str,default="trace.json.zst",help="Output file path for the generated trace (written zstd-compressed; a .zst suffix is appended if missing)")
     parser.add_argument("--bytes-per-element",type=int,default=2,help="Bytes per element for MatMul tensor sizes (default: 2, bf16/fp16)")
     parser.add_argument(
@@ -1339,12 +1367,14 @@ if __name__ == '__main__':
         MAX_COMM_GROUPS_PER_COMM = 1000000
 
     #Must be set before resolve_constants(), which bakes the current
-    #BYTES_PER_ELEMENT into RESOLVED_SHARDING_FORMULAS (comm node sizes) --
-    #resolving first and overriding this after would silently keep comm
-    #sizes at the stale module-level default regardless of --bytes-per-element.
+    #BYTES_PER_ELEMENT into RESOLVED_SHARDING_FORMULAS (comm node sizes) and
+    #the current AXIS_ORDER into AXIS_STRIDES -- resolving first and
+    #overriding these after would silently keep using the stale module-level
+    #defaults regardless of --bytes-per-element / --axis-order.
     BYTES_PER_ELEMENT = args.bytes_per_element
     REUSE_FWD_FSDP = args.reuse_fwd_fsdp
     RECOMPUTE_ACTIVATIONS = args.recompute_activations
+    AXIS_ORDER = args.axis_order
 
     resolve_constants()
 

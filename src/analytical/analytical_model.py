@@ -274,6 +274,30 @@ if __name__ == "__main__":
     walltime_recorder.start("load_trace")
     dag = load_trace(args.trace)
     walltime_recorder.end("load_trace")
+
+    #A comm_group id and a topology host id are both just integers -- nothing
+    #at simulation time checks they mean the same physical NPU. The only
+    #guard against silently simulating a mismatched pair (trace generated
+    #with one --axis-order, topology with another) is this check, so it's a
+    #hard error rather than a warning: a mismatch produces a result that
+    #looks plausible but is physically meaningless.
+    topo_axis_order = physical_topology.axis_order
+    trace_axis_order = dag.graph.get("axis_order")
+    if topo_axis_order is not None and trace_axis_order is not None:
+        if tuple(topo_axis_order) != tuple(trace_axis_order):
+            raise ValueError(
+                f"Axis order mismatch: topology {args.topology!r} was generated with "
+                f"axis_order={','.join(topo_axis_order)}, but trace {args.trace!r} was generated with "
+                f"axis_order={','.join(trace_axis_order)}. comm_group ids would reference the wrong "
+                f"physical NPUs -- regenerate one to match the other's --axis-order."
+            )
+    elif topo_axis_order is None or trace_axis_order is None:
+        logger.warning(
+            "Could not verify axis_order consistency between topology and trace (one or both predate "
+            "this field) -- assuming they match. topology=%s trace=%s",
+            topo_axis_order, trace_axis_order,
+        )
+
     track_overlap = args.overlap or args.perfetto_trace is not None
     
     print(f"Begin Simulation")

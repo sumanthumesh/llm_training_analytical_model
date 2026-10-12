@@ -17,6 +17,8 @@ from network.visualize import visualize_edgelist_file
 
 from itertools import product
 
+import coords
+
 
 def generate_dgx_edgelist(
     npus_per_domain: int,
@@ -77,6 +79,7 @@ def generate_opt_edgelist(
     dp: int,
     cp: int,
     pp: int,
+    axis_order: tuple,
     inner_bandwidth_gbps: float,
     inner_latency_ns: float,
     outer_bandwidth_gbps: float,
@@ -99,23 +102,35 @@ def generate_opt_edgelist(
     assert abs(sum(ring_bandwidth_ratios) - 1.0) < 1e-9, f"ring_bandwidth_ratios must sum to 1.0, got {ring_bandwidth_ratios}"
     dp_ratio, cp_ratio, pp_ratio = ring_bandwidth_ratios
 
+    # The whole ring architecture assumes tp is the interposer-local axis --
+    # unlike gen_dgx_topology.py, there's no flexibility here about which
+    # axis sits innermost, so this is the one hard constraint on axis_order
+    # rather than something derived from npus_per_domain.
+    if axis_order[-1] != "tp":
+        raise ValueError(
+            f"gen_opt_topology.py requires tp to be innermost in --axis-order (got {','.join(axis_order)}): "
+            "the interposer is always the tp-local domain in this architecture."
+        )
+    # dp/cp/pp's relative order among themselves (tp excluded) is what
+    # domain_coords/domain_id below actually use -- see coords/__init__.py.
+    outer_axis_order = tuple(a for a in axis_order if a != "tp")
+    outer_sizes = {"dp": dp, "cp": cp, "pp": pp}
+
     num_domains = dp * cp * pp
     num_hosts = npus_per_domain * num_domains
 
     def domain_coords(domain: int) -> tuple[int, int, int]:
-        # Mirrors trace_generator.py's node_id_from_axes nesting (d outermost,
-        # then c, then p, t innermost/within-domain): interposer `domain`'s
-        # hosts are h[domain*npus_per_domain : (domain+1)*npus_per_domain],
-        # same contiguous-TP-block convention as generate_dgx_edgelist.
-        d = domain // (cp * pp)
-        c = (domain % (cp * pp)) // pp
-        p = domain % pp
-        return d, c, p
+        # Interposer `domain`'s hosts are h[domain*npus_per_domain :
+        # (domain+1)*npus_per_domain], same contiguous-tp-block convention as
+        # generate_dgx_edgelist -- consistent with trace_generator.py's own
+        # numbering as long as both were given the same --axis-order.
+        c = coords.rank_to_coords(domain, outer_sizes, outer_axis_order)
+        return c["dp"], c["cp"], c["pp"]
 
     def domain_id(d: int, c: int, p: int) -> int:
-        return d * cp * pp + c * pp + p
+        return coords.coords_to_rank({"dp": d, "cp": c, "pp": p}, outer_sizes, outer_axis_order)
 
-    
+
 
     def get_all_axis_switches(axis:str)->List[List[int]]:
 
@@ -197,7 +212,8 @@ def generate_opt_edgelist(
 
 
     lines = [
-        f"# {npus_per_domain} NPUs/domain x {num_domains} domain(s) (dp={dp}, cp={cp}, pp={pp}) -- optical topology, interposers ring-connected directly, no spine",
+        f"# {npus_per_domain} NPUs/domain x {num_domains} domain(s) (dp={dp}, cp={cp}, pp={pp}) -- optical topology, interposers ring-connected directly, no spine, axis_order={','.join(axis_order)}",
+        f"Axis_order {','.join(axis_order)}",
         f"Hosts {num_hosts}",
         f"Switches {num_switches}",
         f"Links {num_links}",
@@ -277,6 +293,14 @@ def main():
     parser.add_argument("--dp", type=int, required=True, help="Data-parallel degree (number of DP-ring interposers).")
     parser.add_argument("--cp", type=int, required=True, help="Context-parallel degree (number of CP-ring interposers).")
     parser.add_argument("--pp", type=int, required=True, help="Pipeline-parallel degree (number of PP-ring interposers).")
+    parser.add_argument(
+        "--axis-order",
+        type=coords.axis_order_arg,
+        default=coords.DEFAULT_AXIS_ORDER,
+        help="Outermost-to-innermost nesting of dp,cp,pp,tp into one global NPU rank, comma-separated "
+             f"(default: {','.join(coords.DEFAULT_AXIS_ORDER)}). Must end in tp (the interposer is always "
+             "the tp-local domain here) and must match whatever order trace_generator.py was invoked with."
+    )
     parser.add_argument("--inner-bandwidth-gbps", type=float, required=True, help="Bandwidth from a host to its interposer's local OCS.")
     parser.add_argument("--inner-latency-ns", type=float, required=True, help="Latency from a host to its interposer's local OCS.")
     parser.add_argument("--outer-bandwidth-gbps", type=float, required=True, help="Bandwidth budget split across the DP/CP/PP OCS-to-OCS rings, per --ring-ratios.")
@@ -295,6 +319,7 @@ def main():
         args.dp,
         args.cp,
         args.pp,
+        args.axis_order,
         args.inner_bandwidth_gbps,
         args.inner_latency_ns,
         args.outer_bandwidth_gbps,
@@ -308,7 +333,7 @@ def main():
 
     num_domains = args.dp * args.cp * args.pp
     num_hosts = args.npus_per_domain * num_domains
-    print(f"Wrote {args.output}: {num_hosts} hosts across {num_domains} interposer(s) (dp={args.dp}, cp={args.cp}, pp={args.pp}) of {args.npus_per_domain} NPUs each")
+    print(f"Wrote {args.output}: {num_hosts} hosts across {num_domains} interposer(s) (dp={args.dp}, cp={args.cp}, pp={args.pp}) of {args.npus_per_domain} NPUs each (axis_order={','.join(args.axis_order)})")
 
     if args.visualize:
         svg_path = os.path.splitext(args.output)[0] + ".svg"

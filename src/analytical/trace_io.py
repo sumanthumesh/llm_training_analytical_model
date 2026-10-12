@@ -26,4 +26,10 @@ def load_trace(path: str) -> nx.DiGraph:
         for dep in node.get("deps", []):
             graph.add_edge(dep, node["id"])
 
+    #Graph-level (not per-node) attr: the axis order this trace's comm_group
+    #ids were generated with (see trace_generator.py's write_trace_to_json),
+    #or None for a trace that predates this field. analytical_model.py
+    #cross-checks this against the topology's own axis_order.
+    graph.graph["axis_order"] = data.get("axis_order")
+
     return graph

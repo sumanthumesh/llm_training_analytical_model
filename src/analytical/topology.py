@@ -47,6 +47,12 @@ class Topology:
     num_hosts: int
     num_switches: int
     defaults: dict = field(default_factory=dict)
+    #Outermost-to-innermost axis nesting this topology's host numbering was
+    #generated with (see coords/__init__.py and gen_dgx_topology.py /
+    #gen_opt_topology.py's --axis-order), or None for an edgelist that
+    #predates this field. analytical_model.py cross-checks this against the
+    #trace's own axis_order and refuses to simulate a mismatched pair.
+    axis_order: tuple[str, ...] | None = None
 
     @property
     def hosts(self) -> list[str]:
@@ -200,6 +206,7 @@ def parse_edgelist(path: str) -> Topology:
     }
     num_hosts = 0
     num_switches = 0
+    axis_order = None
 
     with open(path) as f:
         for raw_line in f:
@@ -213,6 +220,8 @@ def parse_edgelist(path: str) -> Topology:
                 num_hosts = int(tokens[1])
                 for h in range(num_hosts):
                     graph.add_node(f"h{h}", type="host")
+            elif keyword == "Axis_order":
+                axis_order = tuple(tokens[1].split(","))
             elif keyword == "Switches":
                 num_switches = int(tokens[1])
                 for s in range(num_switches):
@@ -268,7 +277,7 @@ def parse_edgelist(path: str) -> Topology:
             else:
                 raise ValueError(f"Unrecognized edgelist keyword: {keyword!r} in line: {line!r}")
 
-    return Topology(graph=graph, num_hosts=num_hosts, num_switches=num_switches, defaults=defaults)
+    return Topology(graph=graph, num_hosts=num_hosts, num_switches=num_switches, defaults=defaults, axis_order=axis_order)
 
 
 def draw_topology(topo: Topology, output_path: str | None = None, show: bool = False) -> None:
