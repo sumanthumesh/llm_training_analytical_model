@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import sympy
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, ClassVar, Set, Tuple
 from itertools import product
@@ -13,6 +14,7 @@ import enum
 
 from tracegen import mem_footprint
 from tracegen import compress
+from tracegen import analyze_trace
 import coords
 
 L = sympy.symbols("L")
@@ -1289,6 +1291,87 @@ def check_divisibility():
     #S should be divisible by CP
     assert S.subs(SUBSTITUTE_VALUES) % CP == 0, f"Sequence length {S.subs(SUBSTITUTE_VALUES)} is not divisible by sequence parallelism {CP}"
 
+def collectives_from_formulas() -> Counter:
+    """Closed-form (collective_type, size, num_nodes, axis) -> count, in the
+    exact same shape analyze_trace.count_collectives() returns from a real
+    trace.json -- so these symbolic counts can be diffed directly against
+    what a generated trace actually contains, e.g.:
+
+        formula_counts = collectives_from_formulas()
+        real_counts = analyze_trace.count_collectives("trace.json")
+        for key in formula_counts.keys() | real_counts.keys():
+            if formula_counts[key] != real_counts[key]:
+                print(key, formula_counts[key], "vs", real_counts[key])
+    """
+    counts: Counter = Counter()
+
+    #TP ALL REDUCE
+    tp_all_reduce_size = int(RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES))
+    #The all reduce happens twice per layer in forward pass, twice per layer in backward pass
+    #It happens for each microbatch for each layer for each DP and CP group
+    tp_all_reduce_count_fml = 4*L*(B/dp/M)*dp*cp
+    tp_all_reduce_count = int(tp_all_reduce_count_fml.subs(SUBSTITUTE_VALUES))
+    counts["ALL_REDUCE", tp_all_reduce_size, TP, "TP"] += tp_all_reduce_count
+
+    #CP ALL GATHER (We're considering gathering KV as 1 collective)
+    cp_all_gather_size = int(RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_kv"].subs(SUBSTITUTE_VALUES))
+    #This all gather happens once per layer in forward pass
+    #If we are recomputing activations, then we will need to do one in recompute segment
+    #It happens for each microbatch for each layer for each DP group and TP group
+    cp_all_gather_count_fml = 2*L*(B/dp/M)*dp*tp if RECOMPUTE_ACTIVATIONS else 1*L*(B/dp/M)*dp*tp
+    cp_all_gather_count = int(cp_all_gather_count_fml.subs(SUBSTITUTE_VALUES))
+    counts["ALL_GATHER", cp_all_gather_size, CP, "CP"] += cp_all_gather_count
+
+    #DP ALL GATHER
+    dp_all_gather_size = int(RESOLVED_SHARDING_FORMULAS["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES))
+    #If we are reusing weights then it happens once per layer in forward pass.
+    #If we are not reusing weights then there will be an additional all gather in backward pass
+    #It happens once per layer for only the first microbatch for each CP group and TP group
+    dp_all_gather_count_fml = 2*L*cp*tp if not REUSE_FWD_FSDP else L*cp*tp
+    dp_all_gather_count = int(dp_all_gather_count_fml.subs(SUBSTITUTE_VALUES))
+    counts["ALL_GATHER", dp_all_gather_size, DP, "DP"] += dp_all_gather_count
+
+    #CP ALL REDUCE
+    #This happens once per layer in backward pass for only last microbatch for each DP group and TP group
+    cp_all_reduce_size = int(RESOLVED_SHARDING_FORMULAS["bwd_cp_all_reduce"].subs(SUBSTITUTE_VALUES))
+    cp_all_reduce_count_fml = L*dp*tp
+    cp_all_reduce_count = int(cp_all_reduce_count_fml.subs(SUBSTITUTE_VALUES))
+    counts["ALL_REDUCE", cp_all_reduce_size, CP, "CP"] += cp_all_reduce_count
+
+    #CP REDUCE SCATTER
+    #This happens once per layer in backward pass for each microbatch for each DP group and TP group
+    cp_reduce_scatter_size = int(RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_kv"].subs(SUBSTITUTE_VALUES))
+    cp_reduce_scatter_count_fml = L*(B/dp/M)*dp*tp
+    cp_reduce_scatter_count = int(cp_reduce_scatter_count_fml.subs(SUBSTITUTE_VALUES))
+    counts["REDUCE_SCATTER", cp_reduce_scatter_size, CP, "CP"] += cp_reduce_scatter_count
+
+    #FSDP REDUCE SCATTER
+    #This happens once per layer in backward pass for only first microbatch for each CP group and TP group
+    fsdp_reduce_scatter_size = int(RESOLVED_SHARDING_FORMULAS["bwd_fsdp_reduce_scatter"].subs(SUBSTITUTE_VALUES))
+    fsdp_reduce_scatter_count_fml = L*cp*tp
+    fsdp_reduce_scatter_count = int(fsdp_reduce_scatter_count_fml.subs(SUBSTITUTE_VALUES))
+    counts["REDUCE_SCATTER", fsdp_reduce_scatter_size, DP, "DP"] += fsdp_reduce_scatter_count
+
+    #Pipeline SEND/RECV
+    #This happens once per microbatch for each pipeline stage transition
+    #There are PP-1 transitions for each microbatch in forward direction and PP-1 transitions for each microbatch in backward direction
+    pipeline_send_recv_size = int(RESOLVED_SHARDING_FORMULAS["pipeline_transfer"].subs(SUBSTITUTE_VALUES))
+    pipeline_send_recv_count_fml = 2*(PP-1)*(B/dp/M)*cp*tp*dp
+    pipeline_send_recv_count = int(pipeline_send_recv_count_fml.subs(SUBSTITUTE_VALUES))
+    counts["SEND_RECV", pipeline_send_recv_size, 2, "PP"] += pipeline_send_recv_count
+
+    return counts
+
+
+def report_collectives_from_formulas() -> None:
+    """Prints collectives_from_formulas()'s closed-form counts in the same
+    CSV shape analyze_trace.py prints for a real trace.json, so the two can
+    be diffed by eye (or piped to `diff`) against an analyze_trace run on
+    the trace this same config would generate.
+    """
+    print()
+    print("=== Collective counts (closed-form, from formulas) ===")
+    analyze_trace.write_csv(collectives_from_formulas(), sys.stdout)
 
 
 
@@ -1337,6 +1420,7 @@ if __name__ == '__main__':
              "needs them."
     )
     parser.add_argument("-m","--mem-only",action="store_true",help="Use this flag if you just want to know estimated memory footprint only and aren't interested in trace generation")
+    parser.add_argument("-c","--coll-only",action="store_true",help="Use this flag if you just want to know the different collectives and their sizes and counts only and aren't interested in trace generation")
 
     #I'm fixing the ordering for sharding axes based on how deep inside the model they are located
     #dp replicates entire model
@@ -1398,7 +1482,7 @@ if __name__ == '__main__':
 
     # write_trace_to_json(list(all_nodes_single_layer_single_microbatch.values()), "trace_single_layer.json")
 
-    if not args.mem_only:
+    if not args.mem_only and not args.coll_only:
         gen_start_time = time.time()
         construct_1f1b_schedule(NUM_MICROBATCHES)
         gen_end_time = time.time()
@@ -1411,6 +1495,7 @@ if __name__ == '__main__':
         print(f"Wrote trace to {output_path} in {wr_end_time - wr_start_time:.2f}s")
 
     report_memory_footprint()
+    report_collectives_from_formulas()
 
     print((per_layer_weight_sizes()*tp*(L-2)+2*V*D).subs(SUBSTITUTE_VALUES))
     # per_layer_hand_caclulated = 2*D*H_k*D_h+D*H_q*D_h+D*D+3*D*D_ff
