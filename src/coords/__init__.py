@@ -65,6 +65,22 @@ def rank_to_coords(rank: int, sizes: Dict[str, int], axis_order: Tuple[str, ...]
     return result
 
 
+def achievable_domain_sizes(sizes: Dict[str, int], axis_order: Tuple[str, ...] = DEFAULT_AXIS_ORDER) -> list[int]:
+    """Every trailing-suffix product of axis_order, innermost-axis-alone
+    first and the whole order's full product last -- the complete list of
+    domain sizes a single contiguous inner domain could validly be formed at
+    under this axis_order (see inner_axes_for_domain_size). A sweep over
+    candidate npus_per_domain values should draw from this list, not from an
+    arbitrary range, since only these sizes correspond to a real trailing
+    suffix of axis_order."""
+    sizes_list = []
+    product = 1
+    for axis in reversed(axis_order):
+        product *= sizes[axis]
+        sizes_list.append(product)
+    return sizes_list
+
+
 def inner_axes_for_domain_size(
     npus_per_domain: int, sizes: Dict[str, int], axis_order: Tuple[str, ...] = DEFAULT_AXIS_ORDER
 ) -> Tuple[str, ...]:
@@ -79,14 +95,10 @@ def inner_axes_for_domain_size(
     produce a domain whose "NPUs" aren't actually contiguous ranks, i.e. a
     topology that doesn't correspond to the trace's own numbering at all.
     """
-    achievable = []
-    product = 1
-    for axis in reversed(axis_order):
-        product *= sizes[axis]
-        achievable.append(product)
-        if product == npus_per_domain:
-            count = len(achievable)
-            return tuple(axis_order[len(axis_order) - count:])
+    achievable = achievable_domain_sizes(sizes, axis_order)
+    if npus_per_domain in achievable:
+        count = achievable.index(npus_per_domain) + 1
+        return tuple(axis_order[len(axis_order) - count:])
     raise ValueError(
         f"npus_per_domain={npus_per_domain} doesn't match any trailing-suffix product of "
         f"axis_order={','.join(axis_order)} with sizes={sizes}; achievable domain sizes are {achievable}. "
