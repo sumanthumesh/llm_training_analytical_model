@@ -270,11 +270,11 @@ def generate_opt_edgelist(
     # the physical link between two interposers' same-axis ports runs at
     # its own full rate once it's on the wire.
     for axis in active_axes:
-        print(f"Generating links for {axis} ring(s) (outer bandwidth ratio {axis_ratio[axis]})")
+        # print(f"Generating links for {axis} ring(s) (outer bandwidth ratio {axis_ratio[axis]})")
         for ring in axis_rings[axis]:
-            print(f"  Generating links for ring {ring}")
+            # print(f"  Generating links for ring {ring}")
             for i, domain in enumerate(ring):
-                print(f"    Generating link for domain {domain}")
+                # print(f"    Generating link for domain {domain}")
                 next_domain = ring[(i + 1) % len(ring)]
                 lines.append(
                     f"link {outer_switch(axis, domain)} {outer_switch(axis, next_domain)} direction uni "
