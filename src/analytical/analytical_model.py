@@ -214,7 +214,7 @@ def simulate(
     topo: Topology,
     graph,
     peak_perf_tflops: float,
-    local_mem_bw_gbps: float,
+    local_mem_bw_gbyteps: float,
     verbose: bool = True,
     track_overlap: bool = False,
     fixed_overhead_sec: float = 0.0,
@@ -227,7 +227,7 @@ def simulate(
     walltime_recorder.start("preprocess_nodes")
     for node_id, node in graph.nodes(data=True):
         node["hop_candidates"], node["duration"] = precompute_node(
-            node, routing_table, topo.graph, peak_perf_tflops, local_mem_bw_gbps, fixed_overhead_sec
+            node, routing_table, topo.graph, peak_perf_tflops, local_mem_bw_gbyteps, fixed_overhead_sec
         )
     walltime_recorder.end("preprocess_nodes")
     print(f"Start simpy simulation")
