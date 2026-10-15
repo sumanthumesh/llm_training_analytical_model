@@ -79,9 +79,6 @@ class PathInfo:
         return ",".join(f"({l[0]},{l[1]})" for l in self.links)
 
 
-RoutingTable = dict[tuple[str, str], list["PathInfo"]]
-
-
 def reverse_path(graph: nx.DiGraph, path: PathInfo) -> PathInfo | None:
     """Returns path's exact mirror -- same physical hops, opposite direction
     -- if every one of them has a real reverse edge in the graph, else None.
@@ -109,72 +106,100 @@ def reverse_path(graph: nx.DiGraph, path: PathInfo) -> PathInfo | None:
     return PathInfo(reversed_links, latency_sec, bandwidth_gbps)
 
 
-def build_routing_table(topo: Topology) -> RoutingTable:
-    """All-pairs routing table over hosts only (switches are pass-through hops,
-    never a (src, dst) themselves).
+def _path_info(graph: nx.DiGraph, path: list[str]) -> PathInfo:
+    hops = list(zip(path, path[1:]))
+    links = frozenset(hops)
+    latency_sec = sum(graph.edges[u, v]["latency_ns"] for u, v in hops) * 1e-9
+    bandwidth_gbps = min(graph.edges[u, v]["speed_Gbps"] for u, v in hops)
+    return PathInfo(links, latency_sec, bandwidth_gbps)
 
-    For each (src, dst), keeps every path tied for lexicographically-best
-    (hop count, total latency, bottleneck bandwidth) -- narrowing in that
-    order, so hop count dominates (e.g. it alone already prefers an
-    inner-domain path over an outer-domain one, since the inner path is
-    physically shorter), latency breaks ties within a hop count, and
-    bandwidth breaks remaining ties (e.g. between same-hop-count paths
-    through different spine switches with different link speeds).
 
-    Every PathInfo kept for a given (src, dst) is therefore genuinely
-    interchangeable -- same latency, same bandwidth -- so a caller can use
-    whichever one is actually free at runtime without it changing the
-    collective's duration. This replaces the old bfs_path_hops, whose load
-    tiebreak was a static per-call-order heuristic; LinkManager now resolves
-    load for real, against actual link availability, at runtime instead.
-
-    Runs one BFS per source and reuses it for every destination from that
-    source, rather than one independent search per (src, dst) pair -- O(hosts)
-    graph traversals instead of O(hosts^2), which is what makes this scale to
-    large host counts (a naive per-pair nx.all_shortest_paths call took over
-    3 minutes at 512 hosts; this approach is well under a second).
+def _tie_break(candidates: list[PathInfo]) -> list[PathInfo]:
+    """Narrows to the lexicographically-best (total latency, bottleneck
+    bandwidth) among candidates -- hop count isn't narrowed here since every
+    candidate passed in is already guaranteed shortest-path (same hop count)
+    by construction. Latency breaks ties first, bandwidth breaks remaining
+    ties (e.g. between same-hop-count paths through different spine
+    switches with different link speeds). Every PathInfo surviving this is
+    therefore genuinely interchangeable -- same latency, same bandwidth --
+    so a caller can use whichever one is actually free at runtime without it
+    changing the collective's duration.
     """
-    table: RoutingTable = {}
-    hosts = topo.hosts
-    graph = topo.graph
+    if not candidates:
+        return candidates
+    best_latency = min(c.latency_sec for c in candidates)
+    candidates = [c for c in candidates if c.latency_sec == best_latency]
+    best_bandwidth = max(c.bandwidth_gbps for c in candidates)
+    candidates = [c for c in candidates if c.bandwidth_gbps == best_bandwidth]
+    return candidates
 
-    def path_info(path: list[str]) -> PathInfo:
-        hops = list(zip(path, path[1:]))
-        links = frozenset(hops)
-        latency_sec = sum(graph.edges[u, v]["latency_ns"] for u, v in hops) * 1e-9
-        bandwidth_gbps = min(graph.edges[u, v]["speed_Gbps"] for u, v in hops)
-        return PathInfo(links, latency_sec, bandwidth_gbps)
 
-    for src in hosts:
-        dist = nx.single_source_shortest_path_length(graph, src)
+def _shortest_paths_between(graph: nx.DiGraph, dist_from_src: dict[str, int], src: str, dst: str) -> list[list[str]]:
+    """Every shortest src->dst path, given src's precomputed single-source
+    distance map. Restricted to dst's ancestor set (nodes lying on SOME
+    shortest src->dst path) rather than every node reachable from src -- the
+    cost of this reconstruction therefore scales with how far dst actually
+    is from src, not with the size of the whole graph.
+    """
+    if dst not in dist_from_src or dist_from_src[dst] == 0:
+        return []
+    target_dist = dist_from_src[dst]
 
-        # Every shortest path from src to each node, built in one pass over
-        # nodes in increasing distance order: a node's paths are its
-        # shortest-path-DAG predecessors' paths, each extended by one hop.
-        # This is what lets every destination reuse the single BFS above
-        # instead of re-deriving its own path set from scratch.
-        paths_from_src: dict[str, list[list[str]]] = {src: [[src]]}
-        for node in sorted(dist, key=dist.get):
-            if node == src:
-                continue
-            preds = [u for u in graph.predecessors(node) if dist.get(u) == dist[node] - 1]
-            paths_from_src[node] = [p + [node] for u in preds for p in paths_from_src[u]]
+    # Backward pass: the ancestor set.
+    ancestors = {dst}
+    frontier = {dst}
+    for d in range(target_dist, 0, -1):
+        frontier = {u for node in frontier for u in graph.predecessors(node) if dist_from_src.get(u) == d - 1}
+        ancestors |= frontier
 
-        for dst in hosts:
-            if src == dst:
-                continue
+    # Forward pass: build path lists only within the ancestor set, in
+    # increasing distance order -- a node's paths are its shortest-path-DAG
+    # predecessors' paths, each extended by one hop.
+    paths_from_src: dict[str, list[list[str]]] = {src: [[src]]}
+    for node in sorted(ancestors, key=lambda n: dist_from_src[n]):
+        if node == src:
+            continue
+        preds = [u for u in graph.predecessors(node) if dist_from_src.get(u) == dist_from_src[node] - 1 and u in ancestors]
+        paths_from_src[node] = [p + [node] for u in preds for p in paths_from_src.get(u, [])]
 
-            candidates = [path_info(p) for p in paths_from_src.get(dst, [])]
+    return paths_from_src.get(dst, [])
 
-            best_latency = min(c.latency_sec for c in candidates)
-            candidates = [c for c in candidates if c.latency_sec == best_latency]
 
-            best_bandwidth = max(c.bandwidth_gbps for c in candidates)
-            candidates = [c for c in candidates if c.bandwidth_gbps == best_bandwidth]
+class LazyRoutingTable:
+    """Resolves (src, dst) -> equal-cost PathInfo candidates on first query,
+    memoizing the result -- unlike an eagerly-built all-pairs table, which
+    precomputes and stores every one of hosts*(hosts-1) possible pairs up
+    front regardless of whether a real run ever asks for them.
 
-            table[src, dst] = candidates
+    It almost never does: a trace only ever queries, for a given host, the
+    handful of ring-neighbor/send-recv partners its collectives actually use
+    (at most one per parallelism axis -- dp/cp/pp/tp -- so at most ~4
+    distinct destinations per source across an entire run), and the exact
+    same small set of pairs recurs every layer and microbatch. Measured on a
+    512-host ring topology: a real trace queried only 1,024 of the 261,632
+    possible host pairs: eager precompute of all of them took 25.8s and
+    2.4GB; resolving just the 1,024 actually needed, lazily, with no further
+    sharing across different destinations from the same source (see the
+    decision this was benchmarked against for the discarded alternative --
+    caching each source's BFS distance map too, which traded ~40% more peak
+    memory for roughly half as many BFS calls), took 0.37s and 62MB.
 
-    return table
+    Supports the same `table[src, dst]` subscript interface the old
+    eagerly-built dict did, so it's a drop-in replacement everywhere a
+    routing table is read from.
+    """
+
+    def __init__(self, graph: nx.DiGraph):
+        self.graph = graph
+        self._cache: dict[tuple[str, str], list[PathInfo]] = {}
+
+    def __getitem__(self, key: tuple[str, str]) -> list[PathInfo]:
+        if key not in self._cache:
+            src, dst = key
+            dist_from_src = nx.single_source_shortest_path_length(self.graph, src)
+            paths = _shortest_paths_between(self.graph, dist_from_src, src, dst)
+            self._cache[key] = _tie_break([_path_info(self.graph, p) for p in paths])
+        return self._cache[key]
 
 
 def _parse_kv_pairs(tokens: list[str]) -> dict:

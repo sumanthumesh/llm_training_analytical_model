@@ -18,7 +18,7 @@ import logging
 
 import networkx as nx
 
-from analytical.topology import PathInfo, RoutingTable, reverse_path
+from analytical.topology import LazyRoutingTable, PathInfo, reverse_path
 from typing import List, Tuple
 
 logger = logging.getLogger("collectives")
@@ -59,7 +59,7 @@ def bidirectional_hop_candidates(graph: nx.DiGraph, hop_candidates: HopCandidate
     (LinkManager.acquire would block forever). Checking the actual link
     overlap (rather than reasoning about topology shape, hub vs. true ring)
     catches this generally, including for whichever specific candidate
-    build_routing_table picked. Only candidate [0] of each hop is used here
+    LazyRoutingTable resolved. Only candidate [0] of each hop is used here
     -- the same representative-candidate simplification step_time already
     relies on -- so this is a necessary, not perfect-information, check.
 
@@ -109,7 +109,7 @@ def compute_time(matmuls: list[dict], peak_perf_tflops: float, local_mem_bw_gbyt
 
 def precompute_node(
     node: dict,
-    routing_table: RoutingTable,
+    routing_table: LazyRoutingTable,
     graph: nx.DiGraph,
     peak_perf_tflops: float,
     local_mem_bw_gbyteps: float,
@@ -118,7 +118,7 @@ def precompute_node(
     """Returns (hop_candidates, duration_sec) for a single trace node.
     hop_candidates is one list of equal-cost PathInfo alternatives per logical
     hop the collective needs; every alternative for a given hop has the same
-    latency/bandwidth by construction (see build_routing_table), so duration
+    latency/bandwidth by construction (see LazyRoutingTable), so duration
     can be computed here without knowing which one LinkManager ends up using.
     SYNC nodes (barriers, pre/post-layer and pre/post-pipeline markers) and
     DUMMY nodes (a collective over a degree-1 parallelism dimension, e.g. a CP

@@ -5,7 +5,7 @@ import logging
 import simpy
 
 from analytical.collectives import HopCandidates, precompute_node
-from analytical.topology import Topology, build_routing_table, draw_topology, parse_edgelist
+from analytical.topology import LazyRoutingTable, Topology, draw_topology, parse_edgelist
 from analytical.trace_io import load_trace
 
 from typing import Dict,Set,List,Tuple
@@ -219,9 +219,9 @@ def simulate(
     track_overlap: bool = False,
     fixed_overhead_sec: float = 0.0,
 ) -> float:
-    print(f"Compute routing table")
+    print(f"Construct routing table")
     walltime_recorder.start("routing_table")
-    routing_table = build_routing_table(topo)
+    routing_table = LazyRoutingTable(topo.graph)
     walltime_recorder.end("routing_table")
     print(f"Preprocess nodes")
     walltime_recorder.start("preprocess_nodes")
