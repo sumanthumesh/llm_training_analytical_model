@@ -60,8 +60,18 @@ class LinkManager:
     def __init__(self, env: simpy.Environment, topo: Topology):
         self.env = env
         self.available = set(topo.graph.edges())
-        self._changed = env.event()
         self.logger = logging.getLogger("link_manager")
+        # Per-link list of pending retry events -- see acquire()/release()'s
+        # docstrings for why this replaces a single shared "wake everyone"
+        # event: at scale, broadcasting every release to every waiter made
+        # LinkManager.acquire's own candidate-scanning loop (not routing,
+        # not SimPy's own scheduling overhead) the dominant simulation cost
+        # -- profiled at 68% of total wall time on a 512-host/cp=32 config,
+        # with nodes needing ~2.4 acquire attempts on average even at that
+        # modest scale, each attempt rescanning every hop's full candidate
+        # list regardless of whether the released link had anything to do
+        # with this particular waiter.
+        self._waiters: dict[tuple[str, str], list[simpy.Event]] = {}
 
     def acquire(self, hop_candidates: HopCandidates, label: str = ""):
         """Resolves each hop to one of its candidate paths and reserves the
@@ -79,6 +89,13 @@ class LinkManager:
         attempt fails and this has to block -- purely for diagnostics, no
         effect on the reservation logic itself.
         """
+        # hop_candidates is this call's fixed input -- unchanged across
+        # retries of the same acquire() -- so every link any hop could ever
+        # use is computed once here, not re-derived from scratch on every
+        # failed attempt (which, for a 128-member ring with many retries,
+        # was itself turning into a measurable cost once the two bigger
+        # per-attempt costs above were fixed).
+        interest_links = {link for candidates in hop_candidates for path in candidates for link in path.links}
         while True:
             chosen: set[tuple[str, str]] = set()
             for candidates in hop_candidates:
@@ -86,7 +103,19 @@ class LinkManager:
                 for path in candidates:
                     if path.links & chosen:
                         continue
-                    if path.links <= self.available - chosen:
+                    # Equivalent to the old `path.links <= self.available -
+                    # chosen`, but without constructing that difference as a
+                    # new set: self.available holds every free link in the
+                    # WHOLE topology (tens of thousands at scale), so
+                    # rebuilding "available minus chosen" from scratch on
+                    # every hop/candidate/attempt was O(len(self.available))
+                    # -- up to a ring's full hop count worse, per attempt --
+                    # when the actual check only ever needs path.links'
+                    # own handful of elements. The self-collision continue
+                    # just above already guarantees path.links & chosen is
+                    # empty here, so plain subset-of-available is the same
+                    # condition.
+                    if path.links <= self.available:
                         pick = path
                         break
                 if pick is None:
@@ -97,17 +126,33 @@ class LinkManager:
                 return chosen
             busy_links = set()
             for path in candidates:
-                busy_links |= path.links - (self.available - chosen)
+                busy_links |= (path.links - self.available) | (path.links & chosen)
             self.logger.debug("(t=%12.9f) %s failed to issue -- busy link(s): %s", self.env.now, label, sorted(busy_links))
-            yield self._changed
+            # Registered under every candidate link across every hop -- not
+            # just this attempt's busy_links -- because a hop can fail from
+            # pure self-collision (its candidates are all actually free, but
+            # already tentatively claimed by an EARLIER hop of this same
+            # attempt): the only thing that can ever change that outcome is
+            # a release relevant to that EARLIER hop's own candidates, which
+            # busy_links (computed from the failing hop alone) would miss --
+            # silently under-registering here would mean this waiter is
+            # never woken again, a real hang, not just a slowdown.
+            retry = self.env.event()
+            for link in interest_links:
+                self._waiters.setdefault(link, []).append(retry)
+            yield retry
 
     def release(self, links: set[tuple[str, str]]):
         self.available |= links
-        changed, self._changed = self._changed, self.env.event()
-        changed.succeed()
+        woken: set[int] = set()
+        for link in links:
+            for event in self._waiters.pop(link, ()):
+                if not event.triggered and id(event) not in woken:
+                    event.succeed()
+                    woken.add(id(event))
 
 
-def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbose: bool, track_overlap: bool):
+def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbose: bool, track_overlap: bool, progress_state: dict | None = None):
     node = graph.nodes[node_id]
     deps = list(graph.predecessors(node_id))
     if deps:
@@ -127,6 +172,18 @@ def run_node(env, node_id, graph, link_manager: LinkManager, done_events, verbos
     if verbose:
         print(f"{env.now:12.9f}  complete {node_id:>3}  {node['subtype']:<14} {node['name']}")
     done_events[node_id].succeed()
+
+    if progress_state is not None:
+        # Periodic "completed X/Y nodes" updates instead of a line per node
+        # per event -- for a multi-million-node trace, verbose's per-node
+        # issue/complete output is one or two orders of magnitude more log
+        # volume than anyone actually reads; this gives the same "is it
+        # still making progress" visibility at ~200 lines regardless of
+        # trace size, same style as Preprocess nodes' own progress lines.
+        progress_state["completed"] += 1
+        i = progress_state["completed"]
+        if i % progress_state["interval"] == 0 or i == progress_state["total"]:
+            print(f"  completed {i}/{progress_state['total']} nodes ({100*i/progress_state['total']:.1f}%)", flush=True)
 
 
 def classify_overlap(graph) -> dict[str, float]:
@@ -218,6 +275,7 @@ def simulate(
     verbose: bool = True,
     track_overlap: bool = False,
     fixed_overhead_sec: float = 0.0,
+    progress: bool = False,
 ) -> float:
     print(f"Construct routing table")
     walltime_recorder.start("routing_table")
@@ -225,10 +283,14 @@ def simulate(
     walltime_recorder.end("routing_table")
     print(f"Preprocess nodes")
     walltime_recorder.start("preprocess_nodes")
-    for node_id, node in graph.nodes(data=True):
+    total_nodes = graph.number_of_nodes()
+    progress_interval = max(1, total_nodes // 200)  # ~200 progress lines regardless of trace size
+    for i, (node_id, node) in enumerate(graph.nodes(data=True), 1):
         node["hop_candidates"], node["duration"] = precompute_node(
             node, routing_table, topo.graph, peak_perf_tflops, local_mem_bw_gbyteps, fixed_overhead_sec
         )
+        if i % progress_interval == 0 or i == total_nodes:
+            print(f"  preprocessed {i}/{total_nodes} nodes ({100*i/total_nodes:.1f}%)", flush=True)
     walltime_recorder.end("preprocess_nodes")
     print(f"Start simpy simulation")
     walltime_recorder.start("simpy_simulation")
@@ -236,8 +298,12 @@ def simulate(
     link_manager = LinkManager(env, topo)
     done_events = {node_id: env.event() for node_id in graph.nodes}
 
+    progress_state = None
+    if progress:
+        progress_state = {"completed": 0, "total": total_nodes, "interval": progress_interval}
+
     for node_id in graph.nodes:
-        env.process(run_node(env, node_id, graph, link_manager, done_events, verbose, track_overlap))
+        env.process(run_node(env, node_id, graph, link_manager, done_events, verbose, track_overlap, progress_state))
 
     env.run()
     walltime_recorder.end("simpy_simulation")
@@ -253,6 +319,7 @@ if __name__ == "__main__":
     parser.add_argument("--local-mem-bw", type=float, required=True, help="Local memory bandwidth in GB/s, for COMP node roofline timing.")
     parser.add_argument("--fixed-overhead-ns", type=float, default=0.0, help="Fixed per-op overhead (kernel launch/issue cost) added once per COMM node, in nanoseconds.")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node issue/complete logging.")
+    parser.add_argument("--progress", action="store_true", help="Print periodic 'completed X/Y nodes (Z%%)' updates during the simpy simulation phase (~200 lines regardless of trace size) -- a lighter-weight alternative to the per-node issue/complete lines, useful on large traces where those would otherwise produce millions of lines.")
     parser.add_argument("--overlap", action="store_true", help="Track and report exposed-compute/exposed-comm/overlapped/idle time breakdown.")
     parser.add_argument("--perfetto-trace", type=str, default=None, help="Write a Perfetto/Chrome-trace-format JSON to this path (open at ui.perfetto.dev).")
     parser.add_argument("--debug", type=str, default="", metavar="MODULE[,MODULE...]", help="Enable debug logging for one or more comma-separated modules (e.g. --debug collectives,model).")
@@ -309,6 +376,7 @@ if __name__ == "__main__":
         verbose=not args.quiet,
         track_overlap=track_overlap,
         fixed_overhead_sec=args.fixed_overhead_ns * 1e-9,
+        progress=args.progress,
     )
     print(f"\nSimulation finished at t={finish_time:.9f}s")
 
