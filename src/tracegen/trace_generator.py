@@ -1,4 +1,5 @@
 import argparse
+import csv
 import functools
 import os
 import sys
@@ -1292,86 +1293,120 @@ def check_divisibility():
     assert S.subs(SUBSTITUTE_VALUES) % CP == 0, f"Sequence length {S.subs(SUBSTITUTE_VALUES)} is not divisible by sequence parallelism {CP}"
 
 def collectives_from_formulas() -> Counter:
-    """Closed-form (collective_type, size, num_nodes, axis) -> count, in the
-    exact same shape analyze_trace.count_collectives() returns from a real
-    trace.json -- so these symbolic counts can be diffed directly against
-    what a generated trace actually contains, e.g.:
+    """Closed-form (collective_type, size, per_npu_bytes, num_nodes, axis) ->
+    count. (collective_type, size, num_nodes, axis) matches the shape
+    analyze_trace.count_collectives() returns from a real trace.json exactly
+    -- size is the same total collective payload a trace node's "size" field
+    holds -- so these symbolic counts can be diffed directly against what a
+    generated trace actually contains, e.g.:
 
         formula_counts = collectives_from_formulas()
         real_counts = analyze_trace.count_collectives("trace.json")
-        for key in formula_counts.keys() | real_counts.keys():
-            if formula_counts[key] != real_counts[key]:
-                print(key, formula_counts[key], "vs", real_counts[key])
+        for (ctype, size, _, n, axis), count in formula_counts.items():
+            real_count = real_counts[ctype, size, n, axis]
+            if count != real_count:
+                print(ctype, size, n, axis, count, "vs", real_count)
+
+    per_npu_bytes is the extra column: how much data ONE NPU sends (== what
+    it receives, by the ring's symmetry) for a single occurrence of that
+    collective -- the quantity that actually represents per-link bandwidth
+    demand, unlike "size" (the collective's total payload across every
+    member). For an N-member ring running (N-1) steps of a size/N chunk, that
+    is size*(N-1)/N (ALL_GATHER/REDUCE_SCATTER) or size*2*(N-1)/N
+    (ALL_REDUCE, which is a reduce-scatter followed by an all-gather, so
+    double the steps); SEND_RECV is already a single direct hop, so size
+    passes through unchanged.
     """
     counts: Counter = Counter()
+
+    def add(collective_type, size, direction_multiplier, num_nodes, axis, count):
+        per_npu_bytes = int((direction_multiplier * size).subs(SUBSTITUTE_VALUES))
+        counts[collective_type, size, per_npu_bytes, num_nodes, axis] += count
 
     #TP ALL REDUCE
     tp_all_reduce_size = int(RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES))
     #The all reduce happens twice per layer in forward pass, twice per layer in backward pass
     #It happens for each microbatch for each layer for each DP and CP group
+    #Each NPU sends 1/TP of data, receives 1/TP of data per step for 2*(TP-1) steps
     tp_all_reduce_count_fml = 4*L*(B/dp/M)*dp*cp
     tp_all_reduce_count = int(tp_all_reduce_count_fml.subs(SUBSTITUTE_VALUES))
-    counts["ALL_REDUCE", tp_all_reduce_size, TP, "TP"] += tp_all_reduce_count
+    add("ALL_REDUCE", tp_all_reduce_size, 2*(tp-1)/tp, TP, "TP", tp_all_reduce_count)
 
     #CP ALL GATHER (We're considering gathering KV as 1 collective)
     cp_all_gather_size = int(RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_kv"].subs(SUBSTITUTE_VALUES))
     #This all gather happens once per layer in forward pass
     #If we are recomputing activations, then we will need to do one in recompute segment
     #It happens for each microbatch for each layer for each DP group and TP group
+    #Each NPU sends 1/CP of data, receives 1/CP of data per step for CP-1 steps
     cp_all_gather_count_fml = 2*L*(B/dp/M)*dp*tp if RECOMPUTE_ACTIVATIONS else 1*L*(B/dp/M)*dp*tp
     cp_all_gather_count = int(cp_all_gather_count_fml.subs(SUBSTITUTE_VALUES))
-    counts["ALL_GATHER", cp_all_gather_size, CP, "CP"] += cp_all_gather_count
+    add("ALL_GATHER", cp_all_gather_size, (cp-1)/cp, CP, "CP", cp_all_gather_count)
 
     #DP ALL GATHER
     dp_all_gather_size = int(RESOLVED_SHARDING_FORMULAS["fwd_fsdp_all_gather"].subs(SUBSTITUTE_VALUES))
     #If we are reusing weights then it happens once per layer in forward pass.
     #If we are not reusing weights then there will be an additional all gather in backward pass
     #It happens once per layer for only the first microbatch for each CP group and TP group
+    #Each NPU sends 1/DP of data, receives 1/DP of data per step for DP-1 steps
     dp_all_gather_count_fml = 2*L*cp*tp if not REUSE_FWD_FSDP else L*cp*tp
     dp_all_gather_count = int(dp_all_gather_count_fml.subs(SUBSTITUTE_VALUES))
-    counts["ALL_GATHER", dp_all_gather_size, DP, "DP"] += dp_all_gather_count
+    add("ALL_GATHER", dp_all_gather_size, (dp-1)/dp, DP, "DP", dp_all_gather_count)
 
     #CP ALL REDUCE
     #This happens once per layer in backward pass for only last microbatch for each DP group and TP group
+    #Each NPU sends 1/CP of data, receives 1/CP of data per step for 2*(CP-1) steps
     cp_all_reduce_size = int(RESOLVED_SHARDING_FORMULAS["bwd_cp_all_reduce"].subs(SUBSTITUTE_VALUES))
     cp_all_reduce_count_fml = L*dp*tp
     cp_all_reduce_count = int(cp_all_reduce_count_fml.subs(SUBSTITUTE_VALUES))
-    counts["ALL_REDUCE", cp_all_reduce_size, CP, "CP"] += cp_all_reduce_count
+    add("ALL_REDUCE", cp_all_reduce_size, 2*(cp-1)/cp, CP, "CP", cp_all_reduce_count)
 
     #CP REDUCE SCATTER
     #This happens once per layer in backward pass for each microbatch for each DP group and TP group
+    #Each NPU sends 1/CP of data, receives 1/CP of data per step for CP-1 steps
     cp_reduce_scatter_size = int(RESOLVED_SHARDING_FORMULAS["bwd_cp_reduce_scatter_kv"].subs(SUBSTITUTE_VALUES))
     cp_reduce_scatter_count_fml = L*(B/dp/M)*dp*tp
     cp_reduce_scatter_count = int(cp_reduce_scatter_count_fml.subs(SUBSTITUTE_VALUES))
-    counts["REDUCE_SCATTER", cp_reduce_scatter_size, CP, "CP"] += cp_reduce_scatter_count
+    add("REDUCE_SCATTER", cp_reduce_scatter_size, (cp-1)/cp, CP, "CP", cp_reduce_scatter_count)
 
     #FSDP REDUCE SCATTER
     #This happens once per layer in backward pass for only first microbatch for each CP group and TP group
+    #Each NPU sends 1/DP of data, receives 1/DP of data per step for DP-1 steps
     fsdp_reduce_scatter_size = int(RESOLVED_SHARDING_FORMULAS["bwd_fsdp_reduce_scatter"].subs(SUBSTITUTE_VALUES))
     fsdp_reduce_scatter_count_fml = L*cp*tp
     fsdp_reduce_scatter_count = int(fsdp_reduce_scatter_count_fml.subs(SUBSTITUTE_VALUES))
-    counts["REDUCE_SCATTER", fsdp_reduce_scatter_size, DP, "DP"] += fsdp_reduce_scatter_count
+    add("REDUCE_SCATTER", fsdp_reduce_scatter_size, (dp-1)/dp, DP, "DP", fsdp_reduce_scatter_count)
 
     #Pipeline SEND/RECV
     #This happens once per microbatch for each pipeline stage transition
     #There are PP-1 transitions for each microbatch in forward direction and PP-1 transitions for each microbatch in backward direction
+    #Each NPU sends all data to next stage and receives all data from previous stage -- already a single direct hop, no division.
     pipeline_send_recv_size = int(RESOLVED_SHARDING_FORMULAS["pipeline_transfer"].subs(SUBSTITUTE_VALUES))
     pipeline_send_recv_count_fml = 2*(PP-1)*(B/dp/M)*cp*tp*dp
     pipeline_send_recv_count = int(pipeline_send_recv_count_fml.subs(SUBSTITUTE_VALUES))
-    counts["SEND_RECV", pipeline_send_recv_size, 2, "PP"] += pipeline_send_recv_count
+    add("SEND_RECV", pipeline_send_recv_size, sympy.Integer(1), 2, "PP", pipeline_send_recv_count)
 
     return counts
 
 
+def write_collectives_csv(counts: Counter, output) -> None:
+    """Same row shape as analyze_trace.write_csv, plus the per_npu_bytes
+    column collectives_from_formulas() adds (see its docstring)."""
+    writer = csv.writer(output)
+    writer.writerow(["collective_type", "size", "per_npu_bytes", "num_nodes", "axis", "number_of_times_encountered"])
+    for (collective_type, size, per_npu_bytes, num_nodes, axis), count in sorted(counts.items()):
+        writer.writerow([collective_type, size, per_npu_bytes, num_nodes, axis, count])
+
+
 def report_collectives_from_formulas() -> None:
-    """Prints collectives_from_formulas()'s closed-form counts in the same
-    CSV shape analyze_trace.py prints for a real trace.json, so the two can
-    be diffed by eye (or piped to `diff`) against an analyze_trace run on
-    the trace this same config would generate.
+    """Prints collectives_from_formulas()'s closed-form counts as a CSV,
+    in the same shape (plus the per_npu_bytes column) analyze_trace.py
+    prints for a real trace.json, so the two can be diffed by eye (or piped
+    to `diff`) against an analyze_trace run on the trace this same config
+    would generate.
     """
     print()
     print("=== Collective counts (closed-form, from formulas) ===")
-    analyze_trace.write_csv(collectives_from_formulas(), sys.stdout)
+    write_collectives_csv(collectives_from_formulas(), sys.stdout)
 
 
 
