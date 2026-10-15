@@ -85,7 +85,7 @@ def bidirectional_hop_candidates(graph: nx.DiGraph, hop_candidates: HopCandidate
     return hop_candidates + reverse_hops
 
 
-def roofline_time(flops: float, tensor_size_bytes: float, peak_perf_tflops: float, local_mem_bw_gbps: float) -> float:
+def roofline_time(flops: float, tensor_size_bytes: float, peak_perf_tflops: float, local_mem_bw_gbyteps: float) -> float:
     """Roofline model: an op takes as long as whichever of the compute-bound
     or memory-bound time actually dominates -- see astra-sim's Roofline.cc /
     Workload::issue_comp, which this mirrors (their two-step
@@ -93,18 +93,18 @@ def roofline_time(flops: float, tensor_size_bytes: float, peak_perf_tflops: floa
     collapses to this same max() closed form).
     """
     peak_perf = peak_perf_tflops * 1e12
-    local_mem_bw = local_mem_bw_gbps * 1e9
+    local_mem_bw = local_mem_bw_gbyteps * 1e9
     return max(flops / peak_perf, tensor_size_bytes / local_mem_bw)
 
 
-def compute_time(matmuls: list[dict], peak_perf_tflops: float, local_mem_bw_gbps: float) -> float:
+def compute_time(matmuls: list[dict], peak_perf_tflops: float, local_mem_bw_gbyteps: float) -> float:
     """Time for one inner (parallel) list of a COMP node's comps: everything
     in it runs at once on the same NPU, so their FLOPs and bytes-moved simply
     add up before applying the roofline model once to the totals.
     """
     total_flops = sum(mm["FLOPs_numeric"] for mm in matmuls)
     total_tensor_size = sum(mm["tensor_size_numeric"] for mm in matmuls)
-    return roofline_time(total_flops, total_tensor_size, peak_perf_tflops, local_mem_bw_gbps)
+    return roofline_time(total_flops, total_tensor_size, peak_perf_tflops, local_mem_bw_gbyteps)
 
 
 def precompute_node(
@@ -112,7 +112,7 @@ def precompute_node(
     routing_table: RoutingTable,
     graph: nx.DiGraph,
     peak_perf_tflops: float,
-    local_mem_bw_gbps: float,
+    local_mem_bw_gbyteps: float,
     fixed_overhead_sec: float = 0.0,
 ) -> tuple[HopCandidates, float]:
     """Returns (hop_candidates, duration_sec) for a single trace node.
@@ -152,7 +152,7 @@ def precompute_node(
         return [], 0.0
 
     if node["type"] == "COMP":
-        duration = sum(compute_time(stage, peak_perf_tflops, local_mem_bw_gbps) for stage in node["comps"])
+        duration = sum(compute_time(stage, peak_perf_tflops, local_mem_bw_gbyteps) for stage in node["comps"])
         return [], duration
 
     subtype = node["subtype"]
