@@ -1388,6 +1388,80 @@ def collectives_from_formulas() -> Counter:
     return counts
 
 
+def ring_bandwidth_ratios_from_formulas(
+    *,
+    num_layers: int,
+    kv_heads: int,
+    q_heads: int,
+    head_dim: int,
+    ffn_dim: int,
+    vocab: int,
+    seq_len: int,
+    global_batch: int,
+    microbatch_size: int,
+    dp_degree: int,
+    cp_degree: int,
+    pp_degree: int,
+    tp_degree: int,
+    bytes_per_element: int = 2,
+    recompute_activations: bool = False,
+    reuse_fwd_fsdp: bool = False,
+) -> Tuple[float, float, float]:
+    """(dp_ratio, cp_ratio, pp_ratio) for gen_opt_topology.py's
+    ring_bandwidth_ratios, derived from this exact config's own closed-form
+    collective byte counts (collectives_from_formulas()) instead of a fixed
+    static split -- the per-axis bandwidth each config actually needs varies
+    with (dp, cp, pp, tp, microbatch_size, recompute, reuse), so one static
+    ratio under- or over-provisions some rings depending on the config.
+
+    Per-axis demand is total_bytes_axis = sum(per_npu_bytes * count) over
+    every collective on that axis (TP excluded -- TP never crosses the outer
+    rings, it's interposer-local), weighted by that axis's own size before
+    normalizing. The weighting corrects for collectives_from_formulas()'s
+    count being a GLOBAL total across every independent ring instance of
+    that axis (e.g. the CP formulas implicitly span every (dp, tp,
+    pp-stage) coordinate combination) -- but ring_bandwidth_ratios is
+    applied identically to every single interposer's own output port, so
+    what actually needs comparing across axes is the per-ring-instance
+    total, not the system-wide sum. An axis's number of independent ring
+    instances is total_npus / axis_size, so weighting raw total_bytes_axis
+    by axis_size (and letting the common total_npus factor cancel out in
+    the final normalization) recovers that per-instance quantity.
+
+    Mutates this module's SUBSTITUTE_VALUES/RECOMPUTE_ACTIVATIONS/etc.
+    globals via resolve_constants() -- safe to call repeatedly in the same
+    process (unlike actual trace generation, nothing here touches Node's
+    class-level id/registry state), but don't call it concurrently with an
+    in-progress trace generation in the same process.
+    """
+    global SUBSTITUTE_VALUES, RECOMPUTE_ACTIVATIONS, REUSE_FWD_FSDP, BYTES_PER_ELEMENT
+    SUBSTITUTE_VALUES = {
+        L: num_layers, H_k: kv_heads, H_q: q_heads, D_h: head_dim, D_ff: ffn_dim, V: vocab,
+        S: seq_len, B: global_batch, M: microbatch_size,
+        dp: dp_degree, cp: cp_degree, pp: pp_degree, tp: tp_degree,
+    }
+    RECOMPUTE_ACTIVATIONS = recompute_activations
+    REUSE_FWD_FSDP = reuse_fwd_fsdp
+    BYTES_PER_ELEMENT = bytes_per_element
+    resolve_constants()
+
+    total_bytes = {"DP": 0, "CP": 0, "PP": 0}
+    for (_collective_type, _size, per_npu_bytes, _num_nodes, axis), count in collectives_from_formulas().items():
+        if axis == "TP":
+            continue
+        total_bytes[axis] += per_npu_bytes * count
+
+    axis_size = {"DP": dp_degree, "CP": cp_degree, "PP": pp_degree}
+    weights = {axis: total_bytes[axis] * axis_size[axis] for axis in total_bytes}
+    total_weight = sum(weights.values())
+    if total_weight == 0:
+        # No DP/CP/PP collectives at all (e.g. dp=cp=pp=1, pure TP) -- no
+        # outer rings exist to provision either way, so the split is moot;
+        # fall back to an even default rather than dividing by zero.
+        return (1 / 3, 1 / 3, 1 / 3)
+    return (weights["DP"] / total_weight, weights["CP"] / total_weight, weights["PP"] / total_weight)
+
+
 def write_collectives_csv(counts: Counter, output) -> None:
     """Same row shape as analyze_trace.write_csv, plus the per_npu_bytes
     column collectives_from_formulas() adds (see its docstring)."""
