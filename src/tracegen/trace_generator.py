@@ -610,7 +610,7 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
     else:
         raise ValueError(f"Unknown recompute segment: {segment!r}")
 
-def single_layer_backward_pass(layer_id,microbatch_id):
+def single_layer_backward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
     #FSDP reduce scatter is outside the scope of this function
     pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,NUM_LAYERS)
 
@@ -629,16 +629,26 @@ def single_layer_backward_pass(layer_id,microbatch_id):
     #mb_id==0 gate as forward's own fetch, since 1F1B preserves microbatch
     #ordering: mb 0 is always the first to reach both forward AND backward on
     #any given stage (see get_pp_1f1b_schedule).
+    #Prefetch: gather THIS layer's weights while the layer BEFORE it in
+    #backward order (the next-higher layer id, processed first) is still
+    #computing, instead of waiting for this layer's own pre_layer_sync --
+    #same bounded-one-layer-ahead prefetch forward's fsdp_all_gather already
+    #does (see single_layer_forward_pass), just mirrored for backward's
+    #re-fetch. The last layer of a stage to reach backward has no earlier
+    #(in backward order) layer to overlap with, so the caller leaves
+    #prefetch_dep_node_id unset and it falls back to this layer's own
+    #pre_layer_sync, same as before this change.
     bwd_fsdp_all_gather_nodes = []
     if not REUSE_FWD_FSDP and microbatch_id == 0:
         bwd_fsdp_all_gather_comm_groups = permute_axes(-2,-1,pipeline_stage_id,-1)
+        gather_dep_id = prefetch_dep_node_id if prefetch_dep_node_id is not None else pre_layer_sync_node.id
         for comm_group in bwd_fsdp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(bwd_fsdp_all_gather_comm_groups))]:
             all_gather = make_comm_node(
                 "ALL_GATHER",
                 f"mb{microbatch_id}.layer{layer_id}.bwd.fsdp_all_gather",
                 comm_group,
                 RESOLVED_SHARDING_FORMULAS["fwd_fsdp_all_gather"],
-                [pre_layer_sync_node.id],
+                [gather_dep_id],
                 degree=DP
             )
             bwd_fsdp_all_gather_nodes.append(all_gather)
@@ -839,15 +849,26 @@ def single_layer_backward_pass(layer_id,microbatch_id):
                 [grad_dp_reduce_scatter_sync_node.id],
                 degree=CP
             )
-            grad_cp_all_reduce_nodes.append(grad_all_reduce)    
+            grad_cp_all_reduce_nodes.append(grad_all_reduce)
 
+    # grad_dp_reduce_scatter/grad_cp_all_reduce (last microbatch only) are
+    # deliberately NOT a dependency of post_layer_sync: they're weight-
+    # gradient syncs that only need to finish by the end of this whole
+    # simulated step (nothing here models an optimizer step consuming them),
+    # not before the next layer's backward can start -- same as real FSDP2,
+    # which runs reduce-scatter on a separate stream overlapping with
+    # backward compute of earlier (in backward order) layers instead of
+    # blocking on it. They still get scheduled as their own nodes and still
+    # count toward the simulated finish time (simulate() schedules every
+    # node in the graph and runs until all of them complete) -- this just
+    # stops them from gating anything downstream.
     post_layer_sync_node = Node(
         "SYNC",
         "POST_LAYER",
         f"mb{microbatch_id}.layer{layer_id}.bwd.post_layer_sync",
         [],
         0,
-        [node.id for node in grad_cp_all_reduce_nodes] if microbatch_id == num_microbatches - 1 else [tp_all_reduce_attn_sync_node.id]
+        [tp_all_reduce_attn_sync_node.id]
     )
 
     return [pre_layer_sync_node,post_layer_sync_node]
@@ -898,8 +919,13 @@ def backward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
     # print(f"Received layer_ids for backward pass({pipeline_stage_id}): {layer_ids}")
     layers = []
     L=len(layer_ids)
+    prefetch_dep_node_id = None
     for layer_id in layer_ids:
-        layers.append(single_layer_backward_pass(layer_id,microbatch_id))
+        layer_nodes = single_layer_backward_pass(layer_id,microbatch_id,prefetch_dep_node_id)
+        layers.append(layer_nodes)
+        #Next layer's (in backward order) bwd fsdp_all_gather prefetches
+        #against THIS layer's start.
+        prefetch_dep_node_id = layer_nodes[0].id
 
     #Add a pre pipeline sync
     pre_pipeline_sync_node = Node(
@@ -1369,7 +1395,9 @@ def collectives_from_formulas() -> Counter:
     add("REDUCE_SCATTER", cp_reduce_scatter_size, (cp-1)/cp, CP, "CP", cp_reduce_scatter_count)
 
     #FSDP REDUCE SCATTER
-    #This happens once per layer in backward pass for only first microbatch for each CP group and TP group
+    #This happens once per layer in backward pass for only the last microbatch for each CP group and TP group
+    #(gradients accumulate across microbatches before being reduced, so it can't fire until the last one --
+    #see single_layer_backward_pass's `if microbatch_id == num_microbatches - 1:` guard)
     #Each NPU sends 1/DP of data, receives 1/DP of data per step for DP-1 steps
     fsdp_reduce_scatter_size = int(RESOLVED_SHARDING_FORMULAS["bwd_fsdp_reduce_scatter"].subs(SUBSTITUTE_VALUES))
     fsdp_reduce_scatter_count_fml = L*cp*tp
