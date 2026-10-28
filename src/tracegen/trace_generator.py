@@ -230,7 +230,24 @@ sharding_formulas = {
     "bwd_tp_all_reduce_attn" : M*S/cp*D,
     "bwd_fsdp_reduce_scatter" : per_layer_gradient_sizes(),
     "bwd_cp_all_reduce" : per_layer_gradient_sizes()/dp,
-    "pipeline_transfer" : M*S/cp*D
+    # Sequence parallelism: the activation/gradient handed across a pipeline
+    # stage boundary (X in forward, dX in backward) rests TP-sharded
+    # ([M,S/cp/tp,D], same shape as X/dX everywhere else under SP) --
+    # get_pp_transfer_comm_groups already does one independent point-to-point
+    # hop per (dp,cp,tp) triple (never a collective across tp), so each hop
+    # only ever needs to carry that one tp-rank's own shard, not the full
+    # [M,S/cp,D] a replicated (pre-SP) activation would have required.
+    "pipeline_transfer" : M*S/cp/tp*D,
+    # Sequence parallelism: X/RA rest sharded across TP ([M,S/cp/tp,D]) and
+    # are gathered to the full [M,S/cp,D] whenever a TP-sharded matmul (or a
+    # wgrad needing the full activation) needs them -- same total size as
+    # the tp_all_reduce formulas above, since gathering X/RA up front plus
+    # reduce-scattering the TP-combined result back down (instead of
+    # all-reducing to a replicated result) moves the same combined bytes.
+    "fwd_tp_all_gather_x" : M*S/cp*D,
+    "fwd_tp_all_gather_ra" : M*S/cp*D,
+    "bwd_tp_all_gather_dA_o" : M*S/cp*D,
+    "bwd_tp_all_gather_dF_o" : M*S/cp*D,
 }
 
 def resolve_constants():
@@ -405,6 +422,35 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
         ([node.id for node in fsdp_all_gather_nodes] + [pre_layer_sync_node.id]) if microbatch_id == 0 else [pre_layer_sync_node.id]
     )
 
+    # Sequence-parallel: X rests sharded across TP ([M,S/cp/tp,D], same shard
+    # the residual stream carries between layers) and is gathered back to
+    # [M,S/cp,D] only for the span the (replicated-input) column-parallel
+    # kvq_projections matmuls actually need it -- mirrors
+    # ColumnParallelLinear's "Shard(0) -> Replicate" input redistribution.
+    # Reuses tp_all_reduce_comm_groups's TP-collect/dp,cp,pp-sweep shape since
+    # this is the same TP communicator the attn/ffn collectives below use.
+    tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_id,-2)
+    tp_all_gather_x_nodes = []
+    for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+        all_gather_x = make_comm_node(
+            "ALL_GATHER",
+            f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_gather.x",
+            comm_group,
+            RESOLVED_SHARDING_FORMULAS["fwd_tp_all_gather_x"],
+            [post_fsdp_sync_node.id],
+            degree=TP
+        )
+        tp_all_gather_x_nodes.append(all_gather_x)
+
+    tp_all_gather_x_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.fwd.post_tp_all_gather.x",
+        [],
+        0,
+        [node.id for node in tp_all_gather_x_nodes]
+    )
+
     kvq_projections = [[
         MatMul("X@W_k",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
         MatMul("X@W_v",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
@@ -414,7 +460,7 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
     comp_kvq_projection_node = make_comp_node(
         "MATMUL",
         f"mb{microbatch_id}.layer{layer_id}.fwd.kvq_projections",
-        [post_fsdp_sync_node.id],
+        [tp_all_gather_x_sync_node.id],
         kvq_projections
     )
 
@@ -459,11 +505,17 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
         comp_attn_score_output_projection
     )
 
-    tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_id,-2)
+    # With sequence parallelism, the attention output projection's TP combine
+    # is "Partial -> Shard(0)" -- a reduce-scatter straight into RA's resting
+    # sequence-sharded layout -- instead of "Partial -> Invariant" (a plain
+    # all-reduce to a replicated result). Same total bytes moved as the old
+    # all-reduce (reduce-scatter here + the matching all-gather below cost
+    # the same combined (tp-1)/tp + (tp-1)/tp as one 2*(tp-1)/tp all-reduce),
+    # just reshaped to match RowParallelLinear's SP boundary.
     tp_all_reduce_attn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
         all_reduce_attn = make_comm_node(
-            "ALL_REDUCE",
+            "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.attn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["fwd_tp_all_reduce_attn"],
@@ -481,6 +533,31 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
         [node.id for node in tp_all_reduce_attn_nodes]
     )
 
+    # RA (now sequence-sharded, straight out of the reduce-scatter above plus
+    # the residual add) is gathered back to [M,S/cp,D] for FFN's
+    # (replicated-input) column-parallel up-projections, same pattern as X's
+    # gather before kvq_projections.
+    tp_all_gather_ra_nodes = []
+    for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+        all_gather_ra = make_comm_node(
+            "ALL_GATHER",
+            f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_gather.ra",
+            comm_group,
+            RESOLVED_SHARDING_FORMULAS["fwd_tp_all_gather_ra"],
+            [tp_all_reduce_attn_sync_node.id],
+            degree=TP
+        )
+        tp_all_gather_ra_nodes.append(all_gather_ra)
+
+    tp_all_gather_ra_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.fwd.post_tp_all_gather.ra",
+        [],
+        0,
+        [node.id for node in tp_all_gather_ra_nodes]
+    )
+
     comp_ffn = [
         [
             MatMul("X@W_1",[M,S/cp,D],[D,D_ff/tp],[D],[M,S/cp,D_ff/tp]),
@@ -491,14 +568,14 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
     comp_ffn_node = make_comp_node(
         "MATMUL",
         f"mb{microbatch_id}.layer{layer_id}.fwd.ffn",
-        [tp_all_reduce_attn_sync_node.id],
+        [tp_all_gather_ra_sync_node.id],
         comp_ffn
     )
-    
+
     tp_all_reduce_ffn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
         all_reduce_ffn = make_comm_node(
-            "ALL_REDUCE",
+            "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.fwd.tp_all_reduce.ffn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["fwd_tp_all_reduce_ffn"],
@@ -547,7 +624,35 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
     Returns the last node's id, for the caller to point its real backward
     matmul's dep at instead of depending on dep_id directly.
     """
+    tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_id,-2)
+
     if segment == "ffn":
+        # RA's gathered (full [M,S/cp,D]) form isn't kept resident once
+        # forward's own FFN matmuls are done with it -- same checkpointing
+        # tradeoff as K_hat/V_hat/S/A below, just extended to RA's SP gather.
+        # Re-gather it here, same as single_layer_forward_pass's own
+        # tp_all_gather.ra, before replaying the up-projections.
+        tp_all_gather_ra_nodes = []
+        for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+            all_gather_ra = make_comm_node(
+                "ALL_GATHER",
+                f"mb{microbatch_id}.layer{layer_id}.recomp.tp_all_gather.ra",
+                comm_group,
+                RESOLVED_SHARDING_FORMULAS["fwd_tp_all_gather_ra"],
+                [dep_id],
+                degree=TP
+            )
+            tp_all_gather_ra_nodes.append(all_gather_ra)
+
+        tp_all_gather_ra_sync_node = Node(
+            "SYNC",
+            "BARRIER",
+            f"mb{microbatch_id}.layer{layer_id}.recomp.post_tp_all_gather.ra",
+            [],
+            0,
+            [node.id for node in tp_all_gather_ra_nodes]
+        )
+
         recompute_ffn = [[
             MatMul("X@W_1",[M,S/cp,D],[D,D_ff/tp],[D],[M,S/cp,D_ff/tp]),
             MatMul("X@W_2",[M,S/cp,D],[D,D_ff/tp],[D],[M,S/cp,D_ff/tp]),
@@ -555,12 +660,34 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
         recompute_ffn_node = make_comp_node(
             "MATMUL",
             f"mb{microbatch_id}.layer{layer_id}.recomp.recompute_ffn",
-            [dep_id],
+            [tp_all_gather_ra_sync_node.id],
             recompute_ffn
         )
         return recompute_ffn_node.id
 
     elif segment == "attn":
+        # Same re-gather, for X, before replaying kvq_projections.
+        tp_all_gather_x_nodes = []
+        for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+            all_gather_x = make_comm_node(
+                "ALL_GATHER",
+                f"mb{microbatch_id}.layer{layer_id}.recomp.tp_all_gather.x",
+                comm_group,
+                RESOLVED_SHARDING_FORMULAS["fwd_tp_all_gather_x"],
+                [dep_id],
+                degree=TP
+            )
+            tp_all_gather_x_nodes.append(all_gather_x)
+
+        tp_all_gather_x_sync_node = Node(
+            "SYNC",
+            "BARRIER",
+            f"mb{microbatch_id}.layer{layer_id}.recomp.post_tp_all_gather.x",
+            [],
+            0,
+            [node.id for node in tp_all_gather_x_nodes]
+        )
+
         recompute_kvq = [[
             MatMul("X@W_k",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
             MatMul("X@W_v",[M,S/cp,D],[D,H_k/tp,D_h],[D],[M,S/cp,H_k/tp,D_h]),
@@ -569,7 +696,7 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
         recompute_kvq_node = make_comp_node(
             "MATMUL",
             f"mb{microbatch_id}.layer{layer_id}.recomp.recompute_kvq_projection",
-            [dep_id],
+            [tp_all_gather_x_sync_node.id],
             recompute_kvq
         )
 
@@ -613,6 +740,7 @@ def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, 
 def single_layer_backward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
     #FSDP reduce scatter is outside the scope of this function
     pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,NUM_LAYERS)
+    tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_id,-2)
 
     pre_layer_sync_node = Node(
         "SYNC",
@@ -685,18 +813,69 @@ def single_layer_backward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None)
     if RECOMPUTE_ACTIVATIONS:
         ffn_backward_dep_id = single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, "ffn", post_fsdp_sync_node.id)
 
+    # dF_o arrives sequence-sharded (RowParallelLinear's reduce-scatter in
+    # the forward -- or, before this backward pass even starts, whatever
+    # later layer's dRA_residual/d_hat_F_o produced it -- never replicated
+    # under SP), but dgrad ("dFo@WoF") and wgrad ("F@dFo") both need the full
+    # [M,S/cp,D] gathered across TP first -- RowParallelLinear's backward
+    # dual of its own forward reduce-scatter. Unlike X/RA's gather, this one
+    # isn't gated on RECOMPUTE_ACTIVATIONS: dF_o is a fresh gradient every
+    # microbatch, not a dropped-and-regenerable forward activation.
+    tp_all_gather_dF_o_nodes = []
+    for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+        all_gather_dF_o = make_comm_node(
+            "ALL_GATHER",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_gather.dF_o",
+            comm_group,
+            RESOLVED_SHARDING_FORMULAS["bwd_tp_all_gather_dF_o"],
+            [ffn_backward_dep_id],
+            degree=TP
+        )
+        tp_all_gather_dF_o_nodes.append(all_gather_dF_o)
+
+    # comp_ffn_backward's wgrad matmuls ("RA@dF1"/"RA@dF2") separately need
+    # RA gathered too -- this is a second, independent fresh gather (not a
+    # reuse of single_layer_recompute's own RA gather, if that ran: this one
+    # happens later, at a different point in the dependency chain, and the
+    # Node graph has no notion of a buffer staying resident across that gap
+    # to borrow from instead).
+    tp_all_gather_ra_wgrad_nodes = []
+    for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+        all_gather_ra_wgrad = make_comm_node(
+            "ALL_GATHER",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_gather.ra_wgrad",
+            comm_group,
+            RESOLVED_SHARDING_FORMULAS["fwd_tp_all_gather_ra"],
+            [ffn_backward_dep_id],
+            degree=TP
+        )
+        tp_all_gather_ra_wgrad_nodes.append(all_gather_ra_wgrad)
+
+    tp_all_gather_ffn_backward_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.post_tp_all_gather.ffn",
+        [],
+        0,
+        [node.id for node in tp_all_gather_dF_o_nodes + tp_all_gather_ra_wgrad_nodes]
+    )
+
     comp_ffn_backward_node = make_comp_node(
         "MATMUL",
         f"mb{microbatch_id}.layer{layer_id}.bwd.ffn",
-        [ffn_backward_dep_id],
+        [tp_all_gather_ffn_backward_sync_node.id],
         comp_ffn_backward
     )
 
-    tp_all_reduce_comm_groups = permute_axes(-1,-1, pipeline_stage_from_layer_id(layer_id,NUM_LAYERS),-2)
+    # dRA_FFN's TP combine is "Partial -> Shard(0)" under SP -- a
+    # reduce-scatter straight into dRA's sequence-sharded layout -- instead
+    # of "Partial -> Invariant" (all-reduce to a replicated dRA_FFN). Same
+    # combined bytes as the old all-reduce, split across this and the gather
+    # above, mirroring the forward attn/ffn reduce-scatter change.
     tp_all_reduce_ffn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
         all_reduce_ffn = make_comm_node(
-            "ALL_REDUCE",
+            "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.ffn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_ffn"],
@@ -738,10 +917,34 @@ def single_layer_backward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None)
     if RECOMPUTE_ACTIVATIONS:
         attn_backward_dep_id = single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, "attn", tp_all_reduce_ffn_sync_node.id)
 
+    # dA_o arrives sequence-sharded for the same reason dF_o does above;
+    # dgrad ("dAo@WoA") and wgrad ("A@dAo") both need it gathered across TP
+    # first, unconditionally (same reasoning as dF_o's gather).
+    tp_all_gather_dA_o_nodes = []
+    for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+        all_gather_dA_o = make_comm_node(
+            "ALL_GATHER",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_gather.dA_o",
+            comm_group,
+            RESOLVED_SHARDING_FORMULAS["bwd_tp_all_gather_dA_o"],
+            [attn_backward_dep_id],
+            degree=TP
+        )
+        tp_all_gather_dA_o_nodes.append(all_gather_dA_o)
+
+    tp_all_gather_dA_o_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.post_tp_all_gather.dA_o",
+        [],
+        0,
+        [node.id for node in tp_all_gather_dA_o_nodes]
+    )
+
     comp_attn_backward_node = make_comp_node(
         "MATMUL",
         f"mb{microbatch_id}.layer{layer_id}.bwd.attn_score_output_projection",
-        [attn_backward_dep_id],
+        [tp_all_gather_dA_o_sync_node.id],
         comp_attn_backward
     )
 
@@ -772,6 +975,31 @@ def single_layer_backward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None)
     # all available here, so every matmul below -- the three weight grads and
     # the three dX_partial terms -- depends only on them plus pre-existing
     # X/weights. All six are independent of each other -- one parallel group.
+    # comp_kvq_backward's wgrad matmuls ("X@dK"/"X@dV"/"X@dQ") need X
+    # gathered too -- an independent fresh gather, same reasoning as
+    # comp_ffn_backward's RA gather above (a later point in the chain than
+    # single_layer_recompute's own X gather, if that ran).
+    tp_all_gather_x_wgrad_nodes = []
+    for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
+        all_gather_x_wgrad = make_comm_node(
+            "ALL_GATHER",
+            f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_gather.x_wgrad",
+            comm_group,
+            RESOLVED_SHARDING_FORMULAS["fwd_tp_all_gather_x"],
+            [cp_reduce_scatter_sync_node.id],
+            degree=TP
+        )
+        tp_all_gather_x_wgrad_nodes.append(all_gather_x_wgrad)
+
+    tp_all_gather_x_wgrad_sync_node = Node(
+        "SYNC",
+        "BARRIER",
+        f"mb{microbatch_id}.layer{layer_id}.bwd.post_tp_all_gather.x_wgrad",
+        [],
+        0,
+        [node.id for node in tp_all_gather_x_wgrad_nodes]
+    )
+
     comp_kvq_backward = [[
         MatMul("X@dK",[M,S/cp,D],[M,S/cp,H_k/tp,D_h],[M,S/cp],[D,H_k/tp,D_h]),
         MatMul("X@dV",[M,S/cp,D],[M,S/cp,H_k/tp,D_h],[M,S/cp],[D,H_k/tp,D_h]),
@@ -783,16 +1011,17 @@ def single_layer_backward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None)
     comp_kvq_backward_node = make_comp_node(
         "MATMUL",
         f"mb{microbatch_id}.layer{layer_id}.bwd.kvq_projections",
-        [cp_reduce_scatter_sync_node.id],
+        [tp_all_gather_x_wgrad_sync_node.id],
         comp_kvq_backward
     )
 
-    #Reuse same comm  groups as before
+    # dX_attn's TP combine is "Partial -> Shard(0)" under SP, mirroring the
+    # forward/ffn-backward reduce-scatter changes above.
     tp_all_reduce_attn_nodes = []
     for comm_group in tp_all_reduce_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(tp_all_reduce_comm_groups))]:
 
         all_reduce_attn = make_comm_node(
-            "ALL_REDUCE",
+            "REDUCE_SCATTER",
             f"mb{microbatch_id}.layer{layer_id}.bwd.tp_all_reduce.attn",
             comm_group,
             RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_attn"],
@@ -1349,14 +1578,36 @@ def collectives_from_formulas() -> Counter:
         per_npu_bytes = int((direction_multiplier * size).subs(SUBSTITUTE_VALUES))
         counts[collective_type, size, per_npu_bytes, num_nodes, axis] += count
 
-    #TP ALL REDUCE
+    #TP REDUCE SCATTER (sequence-parallel: replaces the plain all-reduce --
+    #same combined bytes as 2*(tp-1)/tp split across this reduce-scatter and
+    #the SP all-gather below, see sharding_formulas's own comment)
     tp_all_reduce_size = int(RESOLVED_SHARDING_FORMULAS["bwd_tp_all_reduce_attn"].subs(SUBSTITUTE_VALUES))
-    #The all reduce happens twice per layer in forward pass, twice per layer in backward pass
-    #It happens for each microbatch for each layer for each DP and CP group
-    #Each NPU sends 1/TP of data, receives 1/TP of data per step for 2*(TP-1) steps
+    #This (and the matching SP all-gather) happens twice per layer in forward
+    #pass, twice per layer in backward pass -- once each for attn and ffn,
+    #each direction -- for each microbatch for each layer for each DP and CP
+    #group. Each NPU sends/receives 1/TP of data for (TP-1) steps.
     tp_all_reduce_count_fml = 4*L*(B/dp/M)*dp*cp
     tp_all_reduce_count = int(tp_all_reduce_count_fml.subs(SUBSTITUTE_VALUES))
-    add("ALL_REDUCE", tp_all_reduce_size, 2*(tp-1)/tp, TP, "TP", tp_all_reduce_count)
+    add("REDUCE_SCATTER", tp_all_reduce_size, (tp-1)/tp, TP, "TP", tp_all_reduce_count)
+
+    #SP ALL GATHER (sequence-parallel: gathers X/RA/dA_o/dF_o across TP back
+    #to the full [M,S/cp,D] wherever a TP-sharded matmul needs them). Two
+    #groups of 4 per layer per microbatch: {fwd X-gather, fwd RA-gather,
+    #bwd dA_o-gather, bwd dF_o-gather} are each the gather-in dual of one of
+    #the 4 reduce-scatters above (same combined bytes as that single
+    #collective's old 2*(tp-1)/tp all-reduce) -- but single_layer_backward_pass
+    #also re-gathers X and RA a second time each, for comp_kvq_backward's and
+    #comp_ffn_backward's own wgrad matmuls, since the Node graph (like real
+    #SP: see AsyncAllGatherLinear's own docstring on why forward doesn't keep
+    #the gathered activation resident for wgrad) doesn't hold either gather's
+    #result resident across that gap -- 6 total, not 4, genuinely more bytes
+    #than the old all-reduces moved, not just a reshape of them. +2 more
+    #(recomp.tp_all_gather.x/ra) when RECOMPUTE_ACTIVATIONS regenerates X's
+    #and RA's gathers a third time inside single_layer_recompute.
+    tp_all_gather_size = int(RESOLVED_SHARDING_FORMULAS["fwd_tp_all_gather_x"].subs(SUBSTITUTE_VALUES))
+    tp_all_gather_count_fml = (8 if RECOMPUTE_ACTIVATIONS else 6)*L*(B/dp/M)*dp*cp
+    tp_all_gather_count = int(tp_all_gather_count_fml.subs(SUBSTITUTE_VALUES))
+    add("ALL_GATHER", tp_all_gather_size, (tp-1)/tp, TP, "TP", tp_all_gather_count)
 
     #CP ALL GATHER (We're considering gathering KV as 1 collective)
     cp_all_gather_size = int(RESOLVED_SHARDING_FORMULAS["fwd_cp_all_gather_kv"].subs(SUBSTITUTE_VALUES))
@@ -1407,7 +1658,7 @@ def collectives_from_formulas() -> Counter:
     #Pipeline SEND/RECV
     #This happens once per microbatch for each pipeline stage transition
     #There are PP-1 transitions for each microbatch in forward direction and PP-1 transitions for each microbatch in backward direction
-    #Each NPU sends all data to next stage and receives all data from previous stage -- already a single direct hop, no division.
+    #Each NPU sends its own data (its tp-shard, under SP) to next stage and receives the same from previous stage -- already a single direct hop, no ring division.
     pipeline_send_recv_size = int(RESOLVED_SHARDING_FORMULAS["pipeline_transfer"].subs(SUBSTITUTE_VALUES))
     pipeline_send_recv_count_fml = 2*(PP-1)*(B/dp/M)*cp*tp*dp
     pipeline_send_recv_count = int(pipeline_send_recv_count_fml.subs(SUBSTITUTE_VALUES))
