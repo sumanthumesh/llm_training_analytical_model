@@ -49,8 +49,18 @@ class LayerReprForFoorprint:
         return weights
 
     def fwd_activations(self):
+        # Sequence parallelism: X/RA rest sharded across TP ([M,S/cp/tp,D],
+        # the same shard the residual stream carries between layers) and are
+        # gathered to the full [M,S/cp,D] (X_full_fwd/RA_full_fwd, transient
+        # tensors alive only for the span the gathered form is needed) for
+        # the matmuls that need it -- see trace_generator.py's
+        # single_layer_forward_pass for the collective-level version of this
+        # same change. A_o_hat/F_o_hat are the OUTPUT of a reduce-scatter
+        # under SP (not a replicated all-reduce result), so they're sharded
+        # too, matching X/RA's resting shape for the next consumer.
         activations:Dict[str, Tensor] = dict()
-        activations["X"] = Tensor("X",[M,S/cp,D])
+        activations["X"] = Tensor("X",[M,S/cp/tp,D])
+        activations["X_full_fwd"] = Tensor("X_full_fwd",[M,S/cp,D])
 
         activations["K"] = Tensor("K",[M,S/cp,H_k/tp,D_h])
         activations["V"] = Tensor("V",[M,S/cp,H_k/tp,D_h])
@@ -64,16 +74,17 @@ class LayerReprForFoorprint:
 
         activations["A_o"] = Tensor("A_o",[M,S/cp,D])
 
-        activations["A_o_hat"] = Tensor("A_o_hat",[M,S/cp,D])
+        activations["A_o_hat"] = Tensor("A_o_hat",[M,S/cp/tp,D])
 
-        activations["RA"] = Tensor("RA",[M,S/cp,D])
+        activations["RA"] = Tensor("RA",[M,S/cp/tp,D])
+        activations["RA_full_fwd"] = Tensor("RA_full_fwd",[M,S/cp,D])
 
         activations["F1"] = Tensor("F1",[M,S/cp,D_ff/tp])
         activations["F2"] = Tensor("F2",[M,S/cp,D_ff/tp])
         activations["F"] = Tensor("F",[M,S/cp,D_ff/tp])
         activations["F_o"] = Tensor("F_o",[M,S/cp,D])
 
-        activations["F_o_hat"] = Tensor("F_o_hat",[M,S/cp,D])
+        activations["F_o_hat"] = Tensor("F_o_hat",[M,S/cp/tp,D])
 
         return activations
 
@@ -91,9 +102,14 @@ class LayerReprForFoorprint:
             inputs=list(self.weights.values()),
             outputs=list(self.weights.values())
         )
+        gather_x = LayerReprForFoorprint.Step(
+            name="gather_x",
+            inputs=[self.fwd_tensors["X"]],
+            outputs=[self.fwd_tensors["X_full_fwd"]]
+        )
         kvq_projection = LayerReprForFoorprint.Step(
             name="kvq_projection",
-            inputs=[self.fwd_tensors["X"], self.weights["W_k"], self.weights["W_v"], self.weights["W_q"]],
+            inputs=[self.fwd_tensors["X_full_fwd"], self.weights["W_k"], self.weights["W_v"], self.weights["W_q"]],
             outputs=[self.fwd_tensors["K"], self.fwd_tensors["V"], self.fwd_tensors["Q"]]
         )
         cp_all_gather = LayerReprForFoorprint.Step(
@@ -126,11 +142,16 @@ class LayerReprForFoorprint:
             inputs=[self.fwd_tensors["A_o_hat"], self.fwd_tensors["X"]],
             outputs=[self.fwd_tensors["RA"]]
         )
+        gather_ra = LayerReprForFoorprint.Step(
+            name="gather_ra",
+            inputs=[self.fwd_tensors["RA"]],
+            outputs=[self.fwd_tensors["RA_full_fwd"]]
+        )
         ffn1 = LayerReprForFoorprint.Step(
             name="ffn1",
-            inputs=[self.fwd_tensors["RA"], self.weights["W1"], self.weights["W2"]],
+            inputs=[self.fwd_tensors["RA_full_fwd"], self.weights["W1"], self.weights["W2"]],
             outputs=[self.fwd_tensors["F1"], self.fwd_tensors["F2"]]
-        )       
+        )
         ffn2 = LayerReprForFoorprint.Step(
             name="ffn2",
             inputs=[self.fwd_tensors["F1"], self.fwd_tensors["F2"]],
@@ -148,6 +169,7 @@ class LayerReprForFoorprint:
         )
         fwd_layer_steps = [
             fsdp_all_gather,
+            gather_x,
             kvq_projection,
             cp_all_gather,
             score,
@@ -155,6 +177,7 @@ class LayerReprForFoorprint:
             attn_out_proj,
             tp_all_reduce_attn,
             residual_add,
+            gather_ra,
             ffn1,
             ffn2,
             ffn_out_proj,
@@ -164,16 +187,29 @@ class LayerReprForFoorprint:
 
 
     def bwd_gradients(self):
-        
+        # Sequence parallelism: dLoss and every tensor that's just a copy or
+        # a sum of sharded tensors (dRA_residual, dF_o_hat, dRA_FFN, dRA,
+        # dA_o_hat, dX_residual, dX_attn, dX) rest sharded ([M,S/cp/tp,D]),
+        # mirroring X/RA/A_o_hat/F_o_hat in fwd_activations. dF_o/dA_o stay
+        # at the full [M,S/cp,D] -- they're the GATHERED form a real
+        # collective (not an identity) now produces from their _hat
+        # counterpart, see bwd_steps(). dRA_partial/dX_partial stay full
+        # too: they're each TP rank's own Partial pre-collective sum, same
+        # as before SP. X_full_wgrad/RA_full_wgrad are new: the wgrad
+        # matmuls ("X@dK" etc., "RA@dF1" etc.) need X/RA gathered again,
+        # independently of whatever gathered them in forward (or in a
+        # recompute replay) -- see trace_generator.py's single_layer_
+        # backward_pass for the collective-level version of this change.
         tensor_gradients:Dict[str, Tensor] = dict()
         weight_gradients:Dict[str, Tensor] = dict()
-        
-        tensor_gradients["dLoss"] = Tensor("dLoss",[M,S/cp,D])
 
-        tensor_gradients["dRA_residual"] = Tensor("dRA_residual",[M,S/cp,D])
-        tensor_gradients["dF_o_hat"] = Tensor("dF_o_hat",[M,S/cp,D])
-        
+        tensor_gradients["dLoss"] = Tensor("dLoss",[M,S/cp/tp,D])
+
+        tensor_gradients["dRA_residual"] = Tensor("dRA_residual",[M,S/cp/tp,D])
+        tensor_gradients["dF_o_hat"] = Tensor("dF_o_hat",[M,S/cp/tp,D])
+
         tensor_gradients["dF_o"] = Tensor("dF_o",[M,S/cp,D])
+        tensor_gradients["RA_full_wgrad"] = Tensor("RA_full_wgrad",[M,S/cp,D])
         tensor_gradients["dF"] = Tensor("dF",[M,S/cp,D_ff/tp])
         weight_gradients["dW_oF"] = Tensor("dW_oF",[D_ff/tp,D])
 
@@ -184,11 +220,11 @@ class LayerReprForFoorprint:
 
         tensor_gradients["dRA_partial"] = Tensor("dRA_partial",[M,S/cp,D])
 
-        tensor_gradients["dRA_FFN"] = Tensor("dRA_FFN",[M,S/cp,D])
-        tensor_gradients["dRA"] = Tensor("dRA",[M,S/cp,D])
+        tensor_gradients["dRA_FFN"] = Tensor("dRA_FFN",[M,S/cp/tp,D])
+        tensor_gradients["dRA"] = Tensor("dRA",[M,S/cp/tp,D])
 
-        tensor_gradients["dA_o_hat"] = Tensor("dA_o_hat",[M,S/cp,D])
-        tensor_gradients["dX_residual"] = Tensor("dX_residual",[M,S/cp,D])
+        tensor_gradients["dA_o_hat"] = Tensor("dA_o_hat",[M,S/cp/tp,D])
+        tensor_gradients["dX_residual"] = Tensor("dX_residual",[M,S/cp/tp,D])
 
         tensor_gradients["dA_o"] = Tensor("dA_o",[M,S/cp,D])
         tensor_gradients["dA"] = Tensor("dA",[M,S/cp,H_q/tp,D_h])
@@ -201,15 +237,17 @@ class LayerReprForFoorprint:
         tensor_gradients["dK"] = Tensor("dK",[M,S/cp,H_k/tp,D_h])
         tensor_gradients["dV"] = Tensor("dV",[M,S/cp,H_k/tp,D_h])
 
+        tensor_gradients["X_full_wgrad"] = Tensor("X_full_wgrad",[M,S/cp,D])
+
         weight_gradients["dW_k"] = Tensor("dW_k",[D,H_k/tp,D_h])
         weight_gradients["dW_v"] = Tensor("dW_v",[D,H_k/tp,D_h])
         weight_gradients["dW_q"] = Tensor("dW_q",[D,H_q/tp,D_h])
 
         tensor_gradients["dX_partial"] = Tensor("dX_partial",[M,S/cp,D])
 
-        tensor_gradients["dX_attn"] = Tensor("dX_attn",[M,S/cp,D])
+        tensor_gradients["dX_attn"] = Tensor("dX_attn",[M,S/cp/tp,D])
 
-        tensor_gradients["dX"] = Tensor("dX",[M,S/cp,D])
+        tensor_gradients["dX"] = Tensor("dX",[M,S/cp/tp,D])
 
         return tensor_gradients, weight_gradients
 
@@ -223,13 +261,13 @@ class LayerReprForFoorprint:
             outputs=[self.bwd_tensors["dRA_residual"], self.bwd_tensors["dF_o_hat"]]
         )
 
-        # Backward of the forward tp_all_reduce on F_o: a sum's gradient flows
-        # to each contributing tp-rank's local partial unchanged, so this is
-        # an identity rename, not a real collective (see llm_dense_full_pass
-        # Sec. "Single Layer, Single Microbatch, Backward Pass" -> "Gated
-        # Feed Forward", dF_o <- dF_o_hat).
-        bwd_ffn_output_identity = LayerReprForFoorprint.Step(
-            name="bwd_ffn_output_identity",
+        # Under sequence parallelism dF_o_hat arrives sharded (it's dLoss's
+        # own shard, or whatever later layer produced it), so this is a real
+        # gather across TP now, not the free identity it was pre-SP (a
+        # replicated tensor's gradient needing no collective) -- see
+        # trace_generator.py's bwd.tp_all_gather.dF_o.
+        bwd_gather_dF_o = LayerReprForFoorprint.Step(
+            name="bwd_gather_dF_o",
             inputs=[self.bwd_tensors["dF_o_hat"]],
             outputs=[self.bwd_tensors["dF_o"]]
         )
@@ -249,15 +287,24 @@ class LayerReprForFoorprint:
             outputs=[self.bwd_tensors["dF1"], self.bwd_tensors["dF2"]]
         )
 
+        # bwd_ffn1's wgrad needs RA gathered again -- a fresh, independent
+        # gather, not a reuse of forward's (or a recompute replay's) own
+        # gather_ra, see fwd_activations's RA_full_fwd vs this RA_full_wgrad.
+        bwd_gather_ra_wgrad = LayerReprForFoorprint.Step(
+            name="bwd_gather_ra_wgrad",
+            inputs=[self.fwd_tensors["RA"]],
+            outputs=[self.bwd_tensors["RA_full_wgrad"]]
+        )
+
         bwd_ffn1 = LayerReprForFoorprint.Step(
             name="bwd_ffn1",
-            inputs=[self.fwd_tensors["RA"], self.bwd_tensors["dF1"], self.bwd_tensors["dF2"], self.weights["W1"], self.weights["W2"]],
+            inputs=[self.bwd_tensors["RA_full_wgrad"], self.bwd_tensors["dF1"], self.bwd_tensors["dF2"], self.weights["W1"], self.weights["W2"]],
             outputs=[self.bwd_weight_grads["dW1"], self.bwd_weight_grads["dW2"], self.bwd_tensors["dRA_partial"]]
         )
 
-        # This one IS a real all-reduce: dRA_partial is each tp-rank's own
-        # partial sum over its D_ff/tp contraction shard, not yet the true
-        # gradient.
+        # Reduce-scatter under SP (was an all-reduce pre-SP): dRA_partial is
+        # each tp-rank's own partial sum over its D_ff/tp contraction shard,
+        # combined straight into dRA_FFN's sharded resting layout.
         bwd_tp_all_reduce_ffn_dRA = LayerReprForFoorprint.Step(
             name="bwd_tp_all_reduce_ffn_dRA",
             inputs=[self.bwd_tensors["dRA_partial"]],
@@ -276,10 +323,10 @@ class LayerReprForFoorprint:
             outputs=[self.bwd_tensors["dA_o_hat"], self.bwd_tensors["dX_residual"]]
         )
 
-        # Identity, same reasoning as bwd_ffn_output_identity, for the
+        # Real gather under SP, same reasoning as bwd_gather_dF_o, for the
         # attention block's tp_all_reduce.
-        bwd_attn_output_identity = LayerReprForFoorprint.Step(
-            name="bwd_attn_output_identity",
+        bwd_gather_dA_o = LayerReprForFoorprint.Step(
+            name="bwd_gather_dA_o",
             inputs=[self.bwd_tensors["dA_o_hat"]],
             outputs=[self.bwd_tensors["dA_o"]]
         )
@@ -309,9 +356,18 @@ class LayerReprForFoorprint:
             outputs=[self.bwd_tensors["dK"], self.bwd_tensors["dV"]]
         )
 
+        # bwd_kvq_projection's wgrad needs X gathered again -- same
+        # reasoning as bwd_gather_ra_wgrad above, independent of forward's
+        # (or a recompute replay's) own gather_x.
+        bwd_gather_x_wgrad = LayerReprForFoorprint.Step(
+            name="bwd_gather_x_wgrad",
+            inputs=[self.fwd_tensors["X"]],
+            outputs=[self.bwd_tensors["X_full_wgrad"]]
+        )
+
         bwd_kvq_projection = LayerReprForFoorprint.Step(
             name="bwd_kvq_projection",
-            inputs=[self.fwd_tensors["X"], self.bwd_tensors["dK"], self.bwd_tensors["dV"], self.bwd_tensors["dQ"]],
+            inputs=[self.bwd_tensors["X_full_wgrad"], self.bwd_tensors["dK"], self.bwd_tensors["dV"], self.bwd_tensors["dQ"]],
             outputs=[self.bwd_weight_grads["dW_k"], self.bwd_weight_grads["dW_v"], self.bwd_weight_grads["dW_q"]]
         )
 
@@ -321,8 +377,10 @@ class LayerReprForFoorprint:
             outputs=[self.bwd_tensors["dX_partial"]]
         )
 
-        # Real all-reduce again: dX_partial is each tp-rank's partial
-        # contraction-shard sum (backward dual of replicating X across tp).
+        # Reduce-scatter under SP (was an all-reduce pre-SP), same reasoning
+        # as bwd_tp_all_reduce_ffn_dRA: dX_partial is each tp-rank's partial
+        # contraction-shard sum, combined straight into dX_attn's sharded
+        # resting layout (backward dual of gathering X across tp).
         bwd_tp_all_reduce_kvq_dX = LayerReprForFoorprint.Step(
             name="bwd_tp_all_reduce_kvq_dX",
             inputs=[self.bwd_tensors["dX_partial"]],
@@ -337,18 +395,20 @@ class LayerReprForFoorprint:
 
         bwd_layer_steps = [
             bwd_residual_add,
-            bwd_ffn_output_identity,
+            bwd_gather_dF_o,
             bwd_ffn_out_proj,
             bwd_ffn_hadamard,
+            bwd_gather_ra_wgrad,
             bwd_ffn1,
             bwd_tp_all_reduce_ffn_dRA,
             bwd_add_residual_ffn,
             bwd_residual_add2,
-            bwd_attn_output_identity,
+            bwd_gather_dA_o,
             bwd_attn_out_proj,
             bwd_attn_score_grad,
             bwd_attn_qk_grad,
             bwd_cp_reduce_scatter,
+            bwd_gather_x_wgrad,
             bwd_kvq_projection,
             bwd_kvq_dx_partial,
             bwd_tp_all_reduce_kvq_dX,
@@ -426,14 +486,17 @@ class LayerReprForFoorprint:
         recomputed tensors have to stay resident (the point of checkpointing
         in the first place):
 
-        - Recompute FFN from RA (ffn1, ffn2 -> F1, F2, F) right before
-          bwd_ffn_out_proj, its first consumer.
-        - Recompute attention from X (kvq_projection, cp_all_gather, score,
-          attn -> K, V, Q, K_hat, V_hat, S, A) right before bwd_attn_out_proj,
-          its first consumer.
+        - Recompute FFN from RA (gather_ra, ffn1, ffn2 -> RA_full_fwd, F1,
+          F2, F) right before bwd_ffn_out_proj, its first consumer. Includes
+          gather_ra: RA_full_fwd is itself one of the dropped-and-recomputed
+          tensors (see layer_liveness), not held resident from forward.
+        - Recompute attention from X (gather_x, kvq_projection, cp_all_gather,
+          score, attn -> X_full_fwd, K, V, Q, K_hat, V_hat, S, A) right
+          before bwd_attn_out_proj, its first consumer. Same reasoning for
+          gather_x/X_full_fwd.
         """
-        recompute_ffn = self._recompute_segment(["ffn1", "ffn2"])
-        recompute_attn = self._recompute_segment(["kvq_projection", "cp_all_gather", "score", "attn"])
+        recompute_ffn = self._recompute_segment(["gather_ra", "ffn1", "ffn2"])
+        recompute_attn = self._recompute_segment(["gather_x", "kvq_projection", "cp_all_gather", "score", "attn"])
 
         spliced = []
         for step in bwd:
