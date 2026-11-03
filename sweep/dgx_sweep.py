@@ -51,6 +51,7 @@ import sys
 from sweep_common import (
     memory_feasible_base_configs, generate_trace, simulate_and_report,
     flatten_config_for_result, run_sweep, write_results_csv, print_best,
+    add_shard_args, select_shard, results_csv_path,
 )
 from network.gen_dgx_topology import generate_dgx_edgelist
 
@@ -136,6 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--fixed-overhead-ns", type=float, default=0.0)
     parser.add_argument("--output-dir", "-o", type=str, default=None, help="Base directory for per-config exp dirs and the results CSV. Required unless --dry-run.")
     parser.add_argument("--max-workers", type=int, default=max(1, os.cpu_count() // 2))
+    add_shard_args(parser)
     parser.add_argument("--dry-run", action="store_true", help="Only run phase 1 (memory feasibility + axis_order/npus_per_domain expansion) and report how many configs would be simulated, then exit -- no trace/topology/simulate, no --output-dir needed.")
     args = parser.parse_args()
 
@@ -152,6 +154,9 @@ if __name__ == "__main__":
     )
     configs = expand_to_topology_configs(base_configs, args.inner_dim_size)
     print(f"{len(base_configs)} memory-feasible (dp,cp,pp,tp,mb,recompute,reuse) configs x (axis_order, npus_per_domain) variants = {len(configs)} configs -- {'dry run, not simulating' if args.dry_run else 'running full trace+simulate for each'}.")
+    if args.num_shards > 1:
+        configs = select_shard(configs, args.shard_index, args.num_shards)
+        print(f"Shard {args.shard_index} of {args.num_shards} (0-based): running {len(configs)} of those configs.")
     if args.dry_run or not configs:
         sys.exit(0)
 
@@ -174,7 +179,7 @@ if __name__ == "__main__":
     print("Phase 2: generating traces/topologies and simulating...")
     results = run_sweep(configs, args.output_dir, run_dgx_config, run_kwargs, args.max_workers)
 
-    csv_path = os.path.join(args.output_dir, "results.csv")
+    csv_path = results_csv_path(args.output_dir, args.shard_index, args.num_shards)
     write_results_csv(results, csv_path)
     print(f"\nWrote {len(results)} results to {csv_path}")
 

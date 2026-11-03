@@ -363,6 +363,28 @@ def run_sweep(configs: list[dict], output_dir: str, run_fn, run_kwargs: dict, ma
     return results
 
 
+def add_shard_args(parser) -> None:
+    """--shard-index/--num-shards: split one sweep across several independent
+    processes (e.g. one Slurm array task per node), since ProcessPoolExecutor
+    can only use the cores of the node it runs on. Every shard rebuilds the
+    same deterministic config list and keeps configs[shard_index::num_shards]
+    -- interleaved rather than contiguous blocks, so neighbouring (similarly
+    expensive) configs land on different shards and the load evens out."""
+    parser.add_argument("--num-shards", type=int, default=1, help="Split the config list into this many shards (default: 1 = no sharding).")
+    parser.add_argument("--shard-index", type=int, default=0, help="Which shard (0-based) this process runs. Merge shard CSVs afterwards with merge_shards.py.")
+
+
+def select_shard(configs: list[dict], shard_index: int, num_shards: int) -> list[dict]:
+    if num_shards < 1 or not 0 <= shard_index < num_shards:
+        raise ValueError(f"need num_shards >= 1 and 0 <= shard_index < num_shards, got shard_index={shard_index} num_shards={num_shards}")
+    return configs[shard_index::num_shards]
+
+
+def results_csv_path(output_dir: str, shard_index: int, num_shards: int) -> str:
+    name = "results.csv" if num_shards == 1 else f"results_shard{shard_index}of{num_shards}.csv"
+    return os.path.join(output_dir, name)
+
+
 def write_results_csv(results: list[dict], path: str) -> None:
     fieldnames = []
     for result in results:
