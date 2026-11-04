@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 *.egg-info/
+
+
+sweep/*.out
+sweep/*.log
+sweep/*.csv
