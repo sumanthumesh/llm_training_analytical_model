@@ -196,9 +196,15 @@ def _shortest_paths_between(graph: nx.DiGraph, dist_from_src: dict[str, int], sr
 
     # Forward pass: build path lists only within the ancestor set, in
     # increasing distance order -- a node's paths are its shortest-path-DAG
-    # predecessors' paths, each extended by one hop.
+    # predecessors' paths, each extended by one hop. Tied on node name as a
+    # secondary key so processing order (and therefore the order paths end
+    # up in below) is reproducible across separate process runs even when
+    # multiple ancestors share the same distance -- ancestors is a set of
+    # node-name strings, and Python randomizes str hashing per process
+    # (PYTHONHASHSEED) by default, so sorting on distance alone would still
+    # let same-distance ties fall back to that per-process hash order.
     paths_from_src: dict[str, list[list[str]]] = {src: [[src]]}
-    for node in sorted(ancestors, key=lambda n: dist_from_src[n]):
+    for node in sorted(ancestors, key=lambda n: (dist_from_src[n], n)):
         if node == src:
             continue
         preds = [u for u in graph.predecessors(node) if dist_from_src.get(u) == dist_from_src[node] - 1 and u in ancestors]

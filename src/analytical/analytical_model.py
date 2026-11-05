@@ -95,7 +95,15 @@ class LinkManager:
         # failed attempt (which, for a 128-member ring with many retries,
         # was itself turning into a measurable cost once the two bigger
         # per-attempt costs above were fixed).
-        interest_links = {link for candidates in hop_candidates for path in candidates for link in path.links}
+        # Sorted once here, into a tuple, rather than left as a set: Python
+        # randomizes str hashing per process by default (PYTHONHASHSEED), so
+        # a raw set of (str, str) link tuples would iterate in a different
+        # order on every run even with identical topology/trace inputs.
+        # Harmless for correctness here (each iteration below is an
+        # independent dict insertion), but sorted once up front so every
+        # link collection this class hands around is reproducible by
+        # construction, not just where it happens to matter today.
+        interest_links = tuple(sorted({link for candidates in hop_candidates for path in candidates for link in path.links}))
         while True:
             chosen: set[tuple[str, str]] = set()
             for candidates in hop_candidates:
@@ -123,7 +131,12 @@ class LinkManager:
                 chosen |= pick.links
             else:
                 self.available -= chosen
-                return chosen
+                # Sorted once here, when the collection is finalized, so
+                # release() below (and any other caller) never needs to sort
+                # it again to iterate deterministically -- see
+                # interest_links's comment above for why a raw set wouldn't
+                # be reproducible across separate process runs.
+                return tuple(sorted(chosen))
             busy_links = set()
             for path in candidates:
                 busy_links |= (path.links - self.available) | (path.links & chosen)
@@ -142,8 +155,10 @@ class LinkManager:
                 self._waiters.setdefault(link, []).append(retry)
             yield retry
 
-    def release(self, links: set[tuple[str, str]]):
-        self.available |= links
+    def release(self, links: Tuple[Tuple[str, str], ...]):
+        # .update(), not |= -- |= requires a literal set on the right-hand
+        # side, and links is now a plain (sorted) tuple, not a set.
+        self.available.update(links)
         woken: set[int] = set()
         for link in links:
             for event in self._waiters.pop(link, ()):
