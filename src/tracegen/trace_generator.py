@@ -1693,19 +1693,27 @@ def ring_bandwidth_ratios_from_formulas(
     with (dp, cp, pp, tp, microbatch_size, recompute, reuse), so one static
     ratio under- or over-provisions some rings depending on the config.
 
-    Per-axis demand is total_bytes_axis = sum(per_npu_bytes * count) over
-    every collective on that axis (TP excluded -- TP never crosses the outer
-    rings, it's interposer-local), weighted by that axis's own size before
-    normalizing. The weighting corrects for collectives_from_formulas()'s
-    count being a GLOBAL total across every independent ring instance of
-    that axis (e.g. the CP formulas implicitly span every (dp, tp,
-    pp-stage) coordinate combination) -- but ring_bandwidth_ratios is
-    applied identically to every single interposer's own output port, so
-    what actually needs comparing across axes is the per-ring-instance
-    total, not the system-wide sum. An axis's number of independent ring
-    instances is total_npus / axis_size, so weighting raw total_bytes_axis
-    by axis_size (and letting the common total_npus factor cancel out in
-    the final normalization) recovers that per-instance quantity.
+    Per-axis demand is the bytes ONE NPU sends on that axis over the whole
+    step (TP excluded -- TP never crosses the outer rings, it's
+    interposer-local). That is what each interposer's port to that axis's
+    ring has to carry (times tp, the same factor for every axis, so it
+    cancels in the normalization). Sent only, not sent+received: links are
+    directed, so the outgoing direction carries exactly what the NPU sends
+    (and for the ring collectives, sent == received anyway).
+
+    - DP/CP (ring collectives): collectives_from_formulas()'s count is a
+      GLOBAL total across every independent ring on that axis, and every
+      one of an occurrence's num_nodes members sends per_npu_bytes -- so
+      the system-wide bytes are per_npu_bytes * count * num_nodes, spread
+      evenly over all num_npus NPUs.
+    - PP (SEND_RECV): that multiplier would be wrong here -- each counted
+      transfer has ONE sender, not pp of them (multiplying by pp overstated
+      PP by pp x its true average). Sends are also uneven across stages: a
+      middle stage sends one fwd + one bwd transfer per microbatch, the
+      first/last stage only one. Since the same ratio is applied to every
+      interposer, PP is provisioned for its busiest NPU: min(2, pp-1)
+      transfers per microbatch (pp=2 has no middle stage, so each stage
+      sends once per microbatch; pp=1 has no PP traffic at all).
 
     Mutates this module's SUBSTITUTE_VALUES/RECOMPUTE_ACTIVATIONS/etc.
     globals via resolve_constants() -- safe to call repeatedly in the same
@@ -1724,14 +1732,18 @@ def ring_bandwidth_ratios_from_formulas(
     BYTES_PER_ELEMENT = bytes_per_element
     resolve_constants()
 
-    total_bytes = {"DP": 0, "CP": 0, "PP": 0}
-    for (_collective_type, _size, per_npu_bytes, _num_nodes, axis), count in collectives_from_formulas().items():
-        if axis == "TP":
+    num_npus = dp_degree * cp_degree * pp_degree * tp_degree
+    weights = {"DP": 0.0, "CP": 0.0, "PP": 0.0}
+    for (_collective_type, _size, per_npu_bytes, num_nodes, axis), count in collectives_from_formulas().items():
+        if axis in ("TP", "PP"):
             continue
-        total_bytes[axis] += per_npu_bytes * count
+        weights[axis] += per_npu_bytes * count * num_nodes / num_npus
 
-    axis_size = {"DP": dp_degree, "CP": cp_degree, "PP": pp_degree}
-    weights = {axis: total_bytes[axis] * axis_size[axis] for axis in total_bytes}
+    # PP: the busiest NPU's own sends (see docstring) -- min(2, pp-1)
+    # transfers per microbatch, each of pipeline_transfer bytes.
+    pp_sends_busiest_npu = int((sympy.Min(2, pp - 1) * B / dp / M).subs(SUBSTITUTE_VALUES))
+    weights["PP"] = pp_sends_busiest_npu * int(RESOLVED_SHARDING_FORMULAS["pipeline_transfer"].subs(SUBSTITUTE_VALUES))
+
     total_weight = sum(weights.values())
     if total_weight == 0:
         # No DP/CP/PP collectives at all (e.g. dp=cp=pp=1, pure TP) -- no
