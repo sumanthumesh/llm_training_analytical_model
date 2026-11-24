@@ -24,6 +24,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import sympy
 
 from tracegen import mem_footprint
+from tracegen.analyze_trace import axis_pair_min_gap
 from analytical.topology import parse_edgelist
 from analytical.trace_io import load_trace
 from analytical.analytical_model import simulate, classify_overlap, walltime_recorder
@@ -227,6 +228,19 @@ def generate_trace(
     return trace_path
 
 
+def _flatten_axis_gaps(gaps: dict) -> dict:
+    """axis_pair_min_gap's frozenset-keyed dict -> flat, JSON/CSV-friendly
+    fields, one per unordered axis pair actually present in this trace (e.g.
+    "axis_gap_min_CP_DP": -2e-9), named with both axes alphabetized so the
+    same pair always produces the same column name regardless of which
+    direction happened to be shorter."""
+    flat = {}
+    for pair, gap in gaps.items():
+        a, b = sorted(pair)
+        flat[f"axis_gap_min_{a}_{b}"] = gap
+    return flat
+
+
 def simulate_and_report(
     edgelist_path: str,
     trace_path: str,
@@ -238,6 +252,7 @@ def simulate_and_report(
     global_batch: int,
     seq_len: int,
     extra_result_fields: dict,
+    axis_gaps: bool = False,
 ) -> dict:
     """Loads edgelist_path + trace_path, resets walltime_recorder (module-
     level singleton inside analytical_model.py whose start() asserts a timer
@@ -247,6 +262,14 @@ def simulate_and_report(
     worker hits "already recorded" without this), runs simulate() +
     classify_overlap(), and returns a result dict merging
     extra_result_fields with the measured metrics.
+
+    axis_gaps=True also runs axis_pair_min_gap (tracegen/analyze_trace.py)
+    and merges its result in, flattened via _flatten_axis_gaps -- one
+    "axis_gap_min_{A}_{B}" field per unordered pair of axes that actually had
+    collectives in this trace. Off by default since it's an extra pass over
+    every COMM node on top of classify_overlap's own; simulate() already
+    always runs with track_overlap=True below regardless, so turning this on
+    costs no extra simulation, just the one additional analysis pass.
 
     simulate() runs with verbose=False/progress=True and its stdout (the
     "Parsing Edgelist"/"Preprocess nodes" progress lines, plus periodic
@@ -280,6 +303,7 @@ def simulate_and_report(
             progress=True,
         )
     breakdown = classify_overlap(graph)
+    axis_gap_fields = _flatten_axis_gaps(axis_pair_min_gap(graph)) if axis_gaps else {}
     analytical_model_wall_time_sec = time.time() - wall_time_start
 
     tokens_per_batch = global_batch * seq_len
@@ -292,6 +316,7 @@ def simulate_and_report(
         "exposed_comm_sec": breakdown["exposed_comm"],
         "overlapped_sec": breakdown["overlapped"],
         "idle_sec": breakdown["idle"],
+        **axis_gap_fields,
         "analytical_model_wall_time_sec": analytical_model_wall_time_sec,
     }
 

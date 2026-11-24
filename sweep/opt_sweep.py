@@ -56,7 +56,7 @@ def expand_to_topology_configs(base_configs: list[dict]) -> list[dict]:
     return [{**base, "axis_order": REPRESENTATIVE_AXIS_ORDER} for base in base_configs]
 
 
-def run_opt_config(config: dict, exp_dir: str, *, trace_kwargs: dict, topo_kwargs: dict) -> dict:
+def run_opt_config(config: dict, exp_dir: str, *, trace_kwargs: dict, topo_kwargs: dict, axis_gaps: bool = False) -> dict:
     trace_path = generate_trace(exp_dir, config, **trace_kwargs)
 
     # Per-config, not a static split -- the per-axis bandwidth each config
@@ -88,6 +88,7 @@ def run_opt_config(config: dict, exp_dir: str, *, trace_kwargs: dict, topo_kwarg
         fixed_overhead_ns=topo_kwargs["fixed_overhead_ns"],
         global_batch=trace_kwargs["global_batch"], seq_len=trace_kwargs["seq_len"],
         extra_result_fields={**flatten_config_for_result(config), "num_npus": config["dp"] * config["cp"] * config["pp"] * config["tp"], "exp_dir": exp_dir},
+        axis_gaps=axis_gaps,
     )
 
 

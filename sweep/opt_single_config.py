@@ -48,6 +48,7 @@ if __name__ == "__main__":
     parser.add_argument("--local-mem-bw-gbyteps", type=float, default=8000.0, help="Local memory (HBM) bandwidth in GB/s (gigaBYTES/sec, not gigabits). Default: B200 HBM3e.")
     parser.add_argument("--fixed-overhead-ns", type=float, default=0.0)
     parser.add_argument("--output-dir", "-o", type=str, required=True, help="Base directory -- the exp dir for this one config is created underneath it, same naming convention as opt_sweep.py's own per-config exp dirs.")
+    parser.add_argument("--axis-gaps", action="store_true", help="Also report the minimum end-to-start gap between collectives on different parallelism axes (e.g. tp vs. cp) for this run -- negative means they overlap in time. Written into result.json as axis_gap_min_<A>_<B> fields, one per axis pair that actually had collectives.")
     args = parser.parse_args()
 
     config = {
@@ -79,7 +80,7 @@ if __name__ == "__main__":
         peak_perf_tflops=args.peak_perf_tflops, local_mem_bw_gbyteps=args.local_mem_bw_gbyteps,
         fixed_overhead_ns=args.fixed_overhead_ns,
     )
-    run_kwargs = dict(trace_kwargs=trace_kwargs, topo_kwargs=topo_kwargs)
+    run_kwargs = dict(trace_kwargs=trace_kwargs, topo_kwargs=topo_kwargs, axis_gaps=args.axis_gaps)
 
     print(f"Running dp={args.dp} cp={args.cp} pp={args.pp} tp={args.tp} mb={args.microbatch_size} "
           f"recompute={args.recompute_activations} reuse={args.reuse_fwd_weights}...")
@@ -93,4 +94,11 @@ if __name__ == "__main__":
     print(f"\nfinish_time_sec={result['finish_time_sec']:.6f}  tokens_per_sec={result['tokens_per_sec']:.2f}")
     print(f"analytical_model_wall_time_sec={result['analytical_model_wall_time_sec']:.2f}")
     print(f"exp_dir={result['exp_dir']}")
+
+    if args.axis_gaps:
+        gap_keys = sorted(k for k in result if k.startswith("axis_gap_min_"))
+        print("\nMinimum end-to-start gap between collectives on different axes (negative = they overlap in time):")
+        for key in gap_keys:
+            print(f"  {key[len('axis_gap_min_'):].replace('_', ' <-> ')}: {result[key]:.9f}s")
+
     print(json.dumps(result, indent=2))

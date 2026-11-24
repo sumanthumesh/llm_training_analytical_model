@@ -336,6 +336,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true", help="Suppress per-node issue/complete logging.")
     parser.add_argument("--progress", action="store_true", help="Print periodic 'completed X/Y nodes (Z%%)' updates during the simpy simulation phase (~200 lines regardless of trace size) -- a lighter-weight alternative to the per-node issue/complete lines, useful on large traces where those would otherwise produce millions of lines.")
     parser.add_argument("--overlap", action="store_true", help="Track and report exposed-compute/exposed-comm/overlapped/idle time breakdown.")
+    parser.add_argument("--axis-gaps", action="store_true", help="Report the minimum end-to-start gap between consecutive collectives on different parallelism axes (e.g. tp vs. cp) -- negative means they actually overlap in time.")
     parser.add_argument("--perfetto-trace", type=str, default=None, help="Write a Perfetto/Chrome-trace-format JSON to this path (open at ui.perfetto.dev).")
     parser.add_argument("--debug", type=str, default="", metavar="MODULE[,MODULE...]", help="Enable debug logging for one or more comma-separated modules (e.g. --debug collectives,model).")
     args = parser.parse_args()
@@ -380,7 +381,7 @@ if __name__ == "__main__":
             topo_axis_order, trace_axis_order,
         )
 
-    track_overlap = args.overlap or args.perfetto_trace is not None
+    track_overlap = args.overlap or args.axis_gaps or args.perfetto_trace is not None
     
     print(f"Begin Simulation")
     finish_time = simulate(
@@ -401,6 +402,20 @@ if __name__ == "__main__":
         print(f"Exposed comm:    {breakdown['exposed_comm']:.9f}s")
         print(f"Overlapped:      {breakdown['overlapped']:.9f}s")
         print(f"Idle:            {breakdown['idle']:.9f}s")
+
+    if args.axis_gaps:
+        # Deferred to here, inside the CLI entry point, rather than imported
+        # at module level -- analytical_model.py otherwise has no dependency
+        # on tracegen (which owns axis classification, a workload-specific
+        # concept this engine knows nothing about -- see classify_axis in
+        # tracegen/analyze_trace.py), and importing/using classify_overlap
+        # or simulate() as a library shouldn't require tracegen to exist.
+        from tracegen.analyze_trace import axis_pair_min_gap
+        print("\nMinimum end-to-start gap between collectives on different axes "
+              "(negative = they overlap in time):")
+        for pair, gap in sorted(axis_pair_min_gap(dag).items(), key=lambda kv: sorted(kv[0])):
+            a, b = sorted(pair)
+            print(f"  {a} <-> {b}: {gap:.9f}s")
 
     if args.perfetto_trace:
         write_perfetto_trace(dag, args.perfetto_trace)
