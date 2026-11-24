@@ -27,7 +27,14 @@ HopCandidates = list[list[PathInfo]]
 
 
 def alpha_beta_time(latency_sec: float, bandwidth_gbps: float, size_bytes: float) -> float:
-    bandwidth_bytes_per_sec = bandwidth_gbps * 2**30 / 8
+    # Decimal Gb/s (1 Gb/s = 1e9 bit/s), the convention every interconnect
+    # spec uses (NVLink, InfiniBand/Ethernet port speeds, NIC rates) -- so an
+    # edgelist's speed_Gbps can be copied straight from a datasheet. This was
+    # 2**30 from d40a026 (Sep 2026) until Nov 2026, which made every link
+    # ~7.4% faster than its datasheet rate; results from that period are not
+    # directly comparable with later ones. Byte sizes (trace "size", memory
+    # capacities) are unaffected -- only the link-rate conversion changed.
+    bandwidth_bytes_per_sec = bandwidth_gbps * 1e9 / 8
     return latency_sec + size_bytes / bandwidth_bytes_per_sec
 
 
