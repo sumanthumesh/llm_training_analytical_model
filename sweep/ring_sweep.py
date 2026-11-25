@@ -29,7 +29,11 @@ axes at step 0.05, 36 for three axes at step 0.1.
 
 The trace does not depend on the ratios, so it is generated ONCE into
 <output-dir>/trace/ and every point reuses it; each point only writes its own
-topology.edgelist and simulates. Each point gets its own exp dir under
+topology.edgelist and simulates. The settings the trace was generated with
+(config, model shape, --bytes-per-element, --fsdp-prefetch, ...) are saved
+to trace/trace_args.json, and a run whose settings differ -- or a trace
+copied in from before that file existed -- is refused instead of silently
+reused. Each point gets its own exp dir under
 --output-dir (named by its ratios) with a result.json that includes a
 "run_info" block (every CLI arg, git commit), same as the other sweeps.
 
@@ -56,7 +60,7 @@ from itertools import product
 
 from sweep_common import (
     generate_trace, simulate_and_report, flatten_config_for_result, divisibility_ok, describe_run,
-    write_results_csv, add_shard_args, select_shard, results_csv_path,
+    write_results_csv, add_shard_args, add_fsdp_prefetch_arg, select_shard, results_csv_path,
 )
 from opt_sweep import REPRESENTATIVE_AXIS_ORDER
 from network.gen_opt_topology import generate_opt_edgelist
@@ -106,20 +110,44 @@ def ratio_tag(ratios: dict) -> str:
     return "_".join(f"{a}{ratios[a]:.4f}" for a in AXES)
 
 
+def check_trace_args(trace_dir: str, wanted: dict) -> None:
+    """Refuse to reuse a trace generated with different settings -- e.g. one
+    copied or symlinked in from another sweep, or one from before
+    --fsdp-prefetch existed (which used the 'layer' schedule)."""
+    args_path = os.path.join(trace_dir, "trace_args.json")
+    if not os.path.exists(args_path):
+        raise SystemExit(
+            f"{trace_dir} has no trace_args.json, so there is no record of what it was generated with (it predates "
+            "this check, and so also predates --fsdp-prefetch, i.e. it uses the old 'layer' schedule). Delete or "
+            "move that trace directory to have this sweep generate a fresh one.")
+    with open(args_path) as f:
+        recorded = json.load(f)
+    diffs = {k: (recorded.get(k), wanted.get(k)) for k in set(recorded) | set(wanted) if recorded.get(k) != wanted.get(k)}
+    if diffs:
+        detail = ", ".join(f"{k}: trace has {old!r}, this run wants {new!r}" for k, (old, new) in sorted(diffs.items()))
+        raise SystemExit(f"{trace_dir} was generated with different settings ({detail}). Use a different --output-dir, "
+                         "or delete that trace directory to regenerate it.")
+
+
 def ensure_trace(output_dir: str, config: dict, trace_kwargs: dict) -> str:
     """Shared trace at <output_dir>/trace/trace.json.zst, generated once.
     Built in a private temp dir and renamed into place, so concurrent shards
     never see a half-written trace; if another shard got there first, its
-    copy is used and ours is discarded."""
+    copy is used and ours is discarded. The settings it was generated with
+    are recorded in trace/trace_args.json and checked on every reuse."""
     trace_dir = os.path.join(output_dir, "trace")
     trace_path = os.path.join(trace_dir, "trace.json.zst")
+    wanted = json.loads(json.dumps({**flatten_config_for_result(config), **trace_kwargs}))
     if os.path.exists(trace_path):
+        check_trace_args(trace_dir, wanted)
         print(f"Reusing trace {trace_path}")
         return trace_path
     tmp_dir = os.path.join(output_dir, f".trace.tmp.{socket.gethostname()}.{os.getpid()}")
     os.makedirs(tmp_dir, exist_ok=True)
     print(f"Generating trace (once for the whole sweep) in {tmp_dir} ...")
     generate_trace(tmp_dir, config, **trace_kwargs)
+    with open(os.path.join(tmp_dir, "trace_args.json"), "w") as f:
+        json.dump(wanted, f, indent=2)
     try:
         os.rename(tmp_dir, trace_dir)
     except OSError:
@@ -238,6 +266,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab", type=int, default=128000)
     parser.add_argument("--bytes-per-element", type=int, default=2)
     parser.add_argument("--single-comm", action="store_true", help="Pass --single-comm to trace_generator.py (much faster/smaller traces, at the cost of modeling only one representative comm group per collective instead of all of them).")
+    add_fsdp_prefetch_arg(parser)
     parser.add_argument("--inner-bandwidth-gbps", type=float, default=7200.0, help="Host-to-interposer bandwidth (default: NVLink 5 class).")
     parser.add_argument("--inner-latency-ns", type=float, default=1000.0)
     parser.add_argument("--outer-bandwidth-gbps", type=float, default=400.0, help="Per-interposer outer budget that the ring ratios split across the DP/CP/PP rings.")
@@ -322,7 +351,7 @@ if __name__ == "__main__":
         global_batch=args.global_batch_size, seq_len=args.seq_len,
         num_layers=args.layers, kv_heads=args.kv_heads, q_heads=args.q_heads, head_dim=args.head_dim,
         ffn_dim=args.ffn_dim, vocab=args.vocab, bytes_per_element=args.bytes_per_element,
-        single_comm=args.single_comm,
+        single_comm=args.single_comm, fsdp_prefetch=args.fsdp_prefetch,
     )
     trace_path = ensure_trace(args.output_dir, config, trace_kwargs)
     if args.trace_only or not points:

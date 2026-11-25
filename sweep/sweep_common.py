@@ -188,6 +188,7 @@ def generate_trace(
     vocab: int,
     bytes_per_element: int,
     single_comm: bool,
+    fsdp_prefetch: str = "stage",
 ) -> str:
     """Runs trace_generator.py as a subprocess for this config (kept a
     subprocess rather than an in-process call: Node._next_id/_all_nodes are
@@ -213,6 +214,7 @@ def generate_trace(
         "--dp", str(config["dp"]), "--cp", str(config["cp"]), "--pp", str(config["pp"]), "--tp", str(config["tp"]),
         "--axis-order", ",".join(axis_order),
         "--bytes-per-element", str(bytes_per_element),
+        "--fsdp-prefetch", fsdp_prefetch,
         "--output", trace_path,
     ]
     if config["recompute_activations"]:
@@ -427,6 +429,20 @@ def run_sweep(configs: list[dict], output_dir: str, run_fn, run_kwargs: dict, ma
     else:
         executor.shutdown(wait=True)
     return results
+
+
+def add_fsdp_prefetch_arg(parser) -> None:
+    """--fsdp-prefetch, passed straight through to trace_generator.py (see
+    its FSDP_PREFETCH): 'stage' (default) lets each pipeline stage start
+    its first-microbatch weight gathers at step start; 'layer' is the
+    original schedule, where a stage's first gather waits for microbatch 0
+    to arrive, so stages gather one after another during pipeline fill.
+    Traces -- and so results -- from before this option existed match
+    'layer'."""
+    parser.add_argument("--fsdp-prefetch", choices=["stage", "layer"], default="stage",
+                        help="When each pipeline stage's first-microbatch FSDP all-gathers may start (default: stage = "
+                             "at step start; layer = the original schedule, waiting for microbatch 0 to arrive). "
+                             "Results from before this flag existed match 'layer'.")
 
 
 def add_shard_args(parser) -> None:

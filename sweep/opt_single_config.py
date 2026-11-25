@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from sweep_common import run_one_config, divisibility_ok, describe_run
+from sweep_common import run_one_config, divisibility_ok, describe_run, add_fsdp_prefetch_arg
 from opt_sweep import run_opt_config, REPRESENTATIVE_AXIS_ORDER
 
 if __name__ == "__main__":
@@ -40,6 +40,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab", type=int, default=128000)
     parser.add_argument("--bytes-per-element", type=int, default=2)
     parser.add_argument("--single-comm", action="store_true", help="Pass --single-comm to trace_generator.py (much faster/smaller traces, at the cost of modeling only one representative comm group per collective instead of all of them).")
+    add_fsdp_prefetch_arg(parser)
     parser.add_argument("--inner-bandwidth-gbps", type=float, default=7200.0, help="Host-to-interposer bandwidth (default: NVLink 5 class).")
     parser.add_argument("--inner-latency-ns", type=float, default=1000.0)
     parser.add_argument("--outer-bandwidth-gbps", type=float, default=400.0, help="Interposer-to-interposer ring bandwidth budget (default: IB NDR class).")
@@ -72,7 +73,7 @@ if __name__ == "__main__":
         global_batch=args.global_batch_size, seq_len=args.seq_len,
         num_layers=args.layers, kv_heads=args.kv_heads, q_heads=args.q_heads, head_dim=args.head_dim,
         ffn_dim=args.ffn_dim, vocab=args.vocab, bytes_per_element=args.bytes_per_element,
-        single_comm=args.single_comm,
+        single_comm=args.single_comm, fsdp_prefetch=args.fsdp_prefetch,
     )
     topo_kwargs = dict(
         inner_bandwidth_gbps=args.inner_bandwidth_gbps, inner_latency_ns=args.inner_latency_ns,

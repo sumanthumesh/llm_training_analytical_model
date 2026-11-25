@@ -66,6 +66,23 @@ BYTES_PER_ELEMENT = 2
 #-- overridden from --reuse-fwd-fsdp; False (the flag's own default) means
 #backward re-fetches them itself on its first microbatch on each stage.
 REUSE_FWD_FSDP = False
+#When each pipeline stage's first-microbatch forward fsdp_all_gathers may
+#start -- overridden from --fsdp-prefetch:
+#  "layer": the original schedule. Layer l+1's gather starts when layer l
+#    starts (one layer ahead), and a stage's FIRST layer gathers only once
+#    that layer's own pre_layer_sync fires, i.e. once microbatch 0 has
+#    arrived from the previous stage. During pipeline fill the stages
+#    therefore gather their weights one after another, even though every
+#    stage but the first sits idle waiting for its input until then.
+#  "stage" (default): a stage starts gathering at step start, independent of
+#    its input. With REUSE_FWD_FSDP the gathered weights stay resident for
+#    the whole step anyway (mem_footprint.py pins them), so all of the
+#    stage's gathers run back-to-back in layer order from step start, at no
+#    extra memory. Without REUSE_FWD_FSDP weights are dropped after use and
+#    the memory model assumes at most one layer gathered ahead, so only the
+#    first layer's gather moves to step start; later layers keep the
+#    one-layer-ahead prefetch.
+FSDP_PREFETCH = "stage"
 #Whether activations are recomputed in the backward pass (dropped after
 #forward, regenerated via single_layer_recompute right before backward
 #needs them -- the standard "activation checkpointing" memory/compute
@@ -368,8 +385,12 @@ def permute_axes(d:int,c:int,p:int,t:int)->List[List[int]]:
 
     return npu_id_matrix.tolist()
 
-def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
+def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None,prev_gather_barrier_id=None):
     #FSDP fetch is outside the scope of this function
+    #Returns [pre_layer_sync, post_layer_sync, gather_barrier]; gather_barrier
+    #is a SYNC node that fires once all of this layer's fsdp_all_gathers are
+    #done (None when this layer has no gathers or FSDP_PREFETCH != "stage")
+    #-- forward_pipeline_stage chains the next layer's gathers onto it.
 
     pipeline_stage_id = pipeline_stage_from_layer_id(layer_id,NUM_LAYERS)
 
@@ -384,26 +405,51 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
 
     #If this is the first microbatch, then we need to fetch weights across fsdp
     fsdp_all_gather_nodes = []
+    gather_barrier_node = None
     if microbatch_id == 0:
         fsdp_all_gather_comm_groups = permute_axes(-2,-1,pipeline_stage_id,-1)
-        #Prefetch: gather THIS layer's weights while the PREVIOUS layer is still
-        #computing, instead of waiting for this layer's own pre_layer_sync --
-        #bounded to exactly one layer ahead, matching llm_dense_full_pass.tex's
-        #PF_{p,m} pseudocode (gathers l+1's weights concurrently with F_{l,m}).
-        #The first layer of a stage has no earlier layer to overlap with, so
-        #the caller leaves prefetch_dep_node_id unset and it falls back to
-        #this layer's own pre_layer_sync, same as before this change.
-        gather_dep_id = prefetch_dep_node_id if prefetch_dep_node_id is not None else pre_layer_sync_node.id
+        #What this layer's gathers wait for (see FSDP_PREFETCH):
+        #- "layer": the previous layer's start (prefetch_dep_node_id) --
+        #  bounded to exactly one layer ahead, matching
+        #  llm_dense_full_pass.tex's PF_{p,m} pseudocode (gathers l+1's
+        #  weights concurrently with F_{l,m}). The first layer of a stage has
+        #  no earlier layer, so the caller leaves prefetch_dep_node_id unset
+        #  and it falls back to this layer's own pre_layer_sync, which waits
+        #  for the stage's input to arrive.
+        #- "stage" + REUSE_FWD_FSDP: the previous layer's gathers finishing
+        #  (prev_gather_barrier_id), and nothing at all for the stage's first
+        #  layer -- the whole stage streams its weights in from step start.
+        #- "stage" without REUSE_FWD_FSDP: same as "layer", except the first
+        #  layer waits for nothing.
+        if FSDP_PREFETCH == "layer":
+            gather_deps = [prefetch_dep_node_id if prefetch_dep_node_id is not None else pre_layer_sync_node.id]
+        elif REUSE_FWD_FSDP:
+            gather_deps = [prev_gather_barrier_id] if prev_gather_barrier_id is not None else []
+        else:
+            gather_deps = [prefetch_dep_node_id] if prefetch_dep_node_id is not None else []
         for comm_group in fsdp_all_gather_comm_groups[:min(MAX_COMM_GROUPS_PER_COMM, len(fsdp_all_gather_comm_groups))]:
             all_gather = make_comm_node(
                 "ALL_GATHER",
                 f"mb{microbatch_id}.layer{layer_id}.fwd.fsdp_all_gather",
                 comm_group,
                 RESOLVED_SHARDING_FORMULAS["fwd_fsdp_all_gather"],
-                [gather_dep_id],
+                list(gather_deps),
                 degree=DP
             )
             fsdp_all_gather_nodes.append(all_gather)
+        if FSDP_PREFETCH == "stage" and REUSE_FWD_FSDP:
+            #One barrier per layer (rather than every next-layer gather
+            #depending on every gather here) keeps the stage's gathers in
+            #layer order across all of its DP rings with 2*G edges per layer
+            #instead of G*G.
+            gather_barrier_node = Node(
+                "SYNC",
+                "BARRIER",
+                f"mb{microbatch_id}.layer{layer_id}.fwd.fsdp_gather_done",
+                [],
+                0,
+                [node.id for node in fsdp_all_gather_nodes]
+            )
 
     #For mb==0, fsdp_all_gather_nodes alone isn't enough: since the prefetch
     #change, they depend on the PREVIOUS layer's start (for overlap), not this
@@ -593,7 +639,7 @@ def single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id=None):
         [node.id for node in tp_all_reduce_ffn_nodes]
     )
 
-    return [pre_layer_sync_node,post_layer_sync_node]
+    return [pre_layer_sync_node,post_layer_sync_node,gather_barrier_node]
 
 def single_layer_recompute(layer_id, microbatch_id, pipeline_stage_id, segment, dep_id):
     """Regenerates ONE of the two groups of forward tensors activation
@@ -1107,11 +1153,16 @@ def forward_pipeline_stage(layer_ids,pipeline_stage_id,microbatch_id):
     layers = []
     L = len(layer_ids)
     prefetch_dep_node_id = None
+    gather_barrier_id = None
     for layer_id in layer_ids:
-        layer_nodes = single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id)
+        layer_nodes = single_layer_forward_pass(layer_id,microbatch_id,prefetch_dep_node_id,gather_barrier_id)
         layers.append(layer_nodes)
-        #Next layer's fsdp_all_gather prefetches against THIS layer's start.
+        #Next layer's fsdp_all_gather prefetches against THIS layer's start
+        #(FSDP_PREFETCH "layer", or "stage" without REUSE_FWD_FSDP), or
+        #against THIS layer's gathers finishing ("stage" with REUSE_FWD_FSDP)
+        #-- single_layer_forward_pass picks which.
         prefetch_dep_node_id = layer_nodes[0].id
+        gather_barrier_id = layer_nodes[2].id if layer_nodes[2] is not None else None
 
     #Add a pre pipeline sync
     pre_pipeline_sync_node = Node(
@@ -1819,6 +1870,17 @@ if __name__ == '__main__':
              "regenerate them via extra recompute nodes (single_layer_recompute) right before backward "
              "needs them."
     )
+    parser.add_argument(
+        "--fsdp-prefetch",
+        choices=["stage", "layer"],
+        default="stage",
+        help="When each pipeline stage's first-microbatch forward FSDP all-gathers may start. 'stage' (default): "
+             "at step start, independent of the stage's input -- with --reuse-fwd-fsdp the whole stage's gathers "
+             "stream back-to-back from step start (weights stay resident anyway), without it only the first "
+             "layer's gather moves to step start. 'layer': the original schedule, where a stage's first gather "
+             "waits for microbatch 0 to arrive from the previous stage, so stages gather one after another "
+             "during pipeline fill. Identical for pp=1 except for when the gathers are issued."
+    )
     parser.add_argument("-m","--mem-only",action="store_true",help="Use this flag if you just want to know estimated memory footprint only and aren't interested in trace generation")
     parser.add_argument("-c","--coll-only",action="store_true",help="Use this flag if you just want to know the different collectives and their sizes and counts only and aren't interested in trace generation")
 
@@ -1859,6 +1921,7 @@ if __name__ == '__main__':
     REUSE_FWD_FSDP = args.reuse_fwd_fsdp
     RECOMPUTE_ACTIVATIONS = args.recompute_activations
     AXIS_ORDER = args.axis_order
+    FSDP_PREFETCH = args.fsdp_prefetch
 
     resolve_constants()
 
