@@ -54,7 +54,7 @@ import sys
 from sweep_common import (
     memory_feasible_base_configs, generate_trace, simulate_and_report,
     flatten_config_for_result, run_sweep, write_results_csv, print_best,
-    add_shard_args, select_shard, results_csv_path,
+    add_shard_args, select_shard, results_csv_path, describe_run,
 )
 # Imported, not copied, so the config list cannot drift from opt_sweep.py's.
 from opt_sweep import expand_to_topology_configs, REPRESENTATIVE_AXIS_ORDER  # noqa: F401
@@ -151,7 +151,7 @@ if __name__ == "__main__":
     run_kwargs = dict(trace_kwargs=trace_kwargs, topo_kwargs=topo_kwargs)
 
     print("Phase 2: generating traces/topologies and simulating...")
-    results = run_sweep(configs, args.output_dir, run_twolevel_config, run_kwargs, args.max_workers)
+    results = run_sweep(configs, args.output_dir, run_twolevel_config, run_kwargs, args.max_workers, run_info=describe_run(args))
 
     csv_path = results_csv_path(args.output_dir, args.shard_index, args.num_shards)
     write_results_csv(results, csv_path)

@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from sweep_common import run_one_config, divisibility_ok
+from sweep_common import run_one_config, divisibility_ok, describe_run
 from opt_sweep import run_opt_config, REPRESENTATIVE_AXIS_ORDER
 
 if __name__ == "__main__":
@@ -84,7 +84,7 @@ if __name__ == "__main__":
 
     print(f"Running dp={args.dp} cp={args.cp} pp={args.pp} tp={args.tp} mb={args.microbatch_size} "
           f"recompute={args.recompute_activations} reuse={args.reuse_fwd_weights}...")
-    result = run_one_config(config, args.output_dir, run_opt_config, run_kwargs)
+    result = run_one_config(config, args.output_dir, run_opt_config, run_kwargs, run_info=describe_run(args))
 
     if "error" in result:
         print(f"\nFAILED -- see {result['exp_dir']}/trace_generator.log or analytical_model.log")

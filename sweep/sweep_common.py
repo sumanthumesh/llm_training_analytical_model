@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import datetime
 import json
 import os
+import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -330,24 +333,62 @@ def flatten_config_for_result(config: dict) -> dict:
     return flat
 
 
-def run_one_config(config: dict, output_dir: str, run_fn, run_kwargs: dict) -> dict:
+REPO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+
+
+def describe_run(args) -> dict:
+    """What produced a sweep's results, for the "run_info" block written into
+    every result.json (see run_one_config): the script, the exact command
+    line, every CLI argument after argparse has filled in defaults (so a
+    default that later changes in the code is still recorded as the value
+    that was actually used), and the code version -- the git commit plus
+    whether tracked files had uncommitted changes, since a result's meaning
+    can change with the code even under identical flags (e.g. the Gbps
+    conversion change of 2026-11-24). Called once in the parent process, so
+    every config of one sweep (or one shard) gets the same block.
+    """
+    def git(*cmd):
+        try:
+            proc = subprocess.run(["git", "-C", REPO_DIR, *cmd], capture_output=True, text=True, timeout=10)
+            return proc.stdout.strip() if proc.returncode == 0 else None
+        except Exception:
+            return None
+
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "script": os.path.basename(sys.argv[0]),
+        "command": shlex.join(["python", *sys.argv]),
+        "cwd": os.getcwd(),
+        "cli_args": dict(vars(args)),
+        "git_commit": git("rev-parse", "HEAD"),
+        "git_uncommitted_changes": None if status is None else bool(status),
+        "hostname": socket.gethostname(),
+        "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def run_one_config(config: dict, output_dir: str, run_fn, run_kwargs: dict, run_info: dict | None = None) -> dict:
     """Runs one config in a worker process via run_fn(config, exp_dir,
     **run_kwargs) -> dict (each sweep script's own topology-specific
     function), capturing any failure into the result dict's "error" key
     instead of aborting the rest of the sweep.
+
+    run_info (see describe_run) is written into result.json under a
+    "run_info" key but left out of the returned dict, so the sweep's own
+    results.csv stays one flat row per config.
     """
     exp_dir = os.path.join(output_dir, exp_dir_name(config))
     os.makedirs(exp_dir, exist_ok=True)
     try:
         result = run_fn(config, exp_dir, **run_kwargs)
         with open(os.path.join(exp_dir, "result.json"), "w") as f:
-            json.dump(result, f, indent=2)
+            json.dump({**result, "run_info": run_info} if run_info is not None else result, f, indent=2)
         return result
     except Exception as e:
         return {**flatten_config_for_result(config), "error": str(e), "exp_dir": exp_dir}
 
 
-def run_sweep(configs: list[dict], output_dir: str, run_fn, run_kwargs: dict, max_workers: int) -> list[dict]:
+def run_sweep(configs: list[dict], output_dir: str, run_fn, run_kwargs: dict, max_workers: int, run_info: dict | None = None) -> list[dict]:
     """Runs every config in configs across a worker pool, printing one
     progress line per completion (see run_opt_sweep.log-style output).
 
@@ -368,7 +409,7 @@ def run_sweep(configs: list[dict], output_dir: str, run_fn, run_kwargs: dict, ma
     """
     results = []
     executor = ProcessPoolExecutor(max_workers=max_workers)
-    futures = [executor.submit(run_one_config, config, output_dir, run_fn, run_kwargs) for config in configs]
+    futures = [executor.submit(run_one_config, config, output_dir, run_fn, run_kwargs, run_info) for config in configs]
     try:
         for i, future in enumerate(as_completed(futures), 1):
             result = future.result()
